@@ -52,8 +52,17 @@ if [[ $actual_fingerprint != "$expected_fingerprint" ]]; then
 fi
 
 echo "== gemmbench =="
+# As amostras nao podem sair coladas. Seis GEMMs grandes seguidos aquecem a CPU
+# e o clock cai: no mesmo binario, sem uma linha alterada em gemm.rs, seis
+# execucoes consecutivas deram 402, 406, 372, 299, 286 e 259 GFLOP/s em
+# "S3 qkv dX" -- 36% de queda monotonica. Com um intervalo entre elas a medida
+# volta ao patamar real e o portao de 3% para de dar alarme falso.
+cooldown=${REGRESS_COOLDOWN:-25}
 gemm_output=""
-for _ in 1 2 3; do
+for n in 1 2 3; do
+    if ((n > 1)); then
+        sleep "$cooldown"
+    fi
     sample=$("$binary" --gemmbench)
     gemm_output+="${sample}"$'\n'
 done
