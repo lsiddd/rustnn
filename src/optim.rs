@@ -35,6 +35,91 @@ pub struct NsScratch {
     bp: PackedB,
 }
 
+/// Copia `g` [rows x cols] para `x`, transpondo quando a matriz e mais alta
+/// que larga: o quintico so precisa do lado menor em `X X^T`.
+#[inline]
+fn load_maybe_t(g: &[f32], x: &mut [f32], rows: usize, cols: usize, tr: bool) {
+    if !tr {
+        x.copy_from_slice(g);
+        return;
+    }
+    for i in 0..rows {
+        for j in 0..cols {
+            x[j * rows + i] = g[i * cols + j];
+        }
+    }
+}
+
+/// O caminho de volta de [`load_maybe_t`].
+#[inline]
+fn store_maybe_t(x: &[f32], g: &mut [f32], rows: usize, cols: usize, tr: bool) {
+    if !tr {
+        g.copy_from_slice(x);
+        return;
+    }
+    for i in 0..rows {
+        for j in 0..cols {
+            g[i * cols + j] = x[j * rows + i];
+        }
+    }
+}
+
+impl NsScratch {
+    /// Uma iteracao do quintico: `X <- a X + (b A + c A A) X`, com `A = X X^T`.
+    #[inline]
+    fn quintic_step(&mut self, m: usize, n: usize) {
+        // A = X X^T
+        gemm_small(
+            m,
+            m,
+            n,
+            &self.x,
+            false,
+            &self.x,
+            true,
+            &mut self.a,
+            false,
+            &mut self.ap,
+            &mut self.bp,
+        );
+        // AA = A A
+        gemm_small(
+            m,
+            m,
+            m,
+            &self.a,
+            false,
+            &self.a,
+            false,
+            &mut self.aa,
+            false,
+            &mut self.ap,
+            &mut self.bp,
+        );
+        // B = b A + c A A, reaproveitando o buffer de A
+        for i in 0..m * m {
+            self.a[i] = NS_B * self.a[i] + NS_C * self.aa[i];
+        }
+        // X <- a X + B X
+        gemm_small(
+            m,
+            n,
+            m,
+            &self.a,
+            false,
+            &self.x,
+            false,
+            &mut self.t,
+            false,
+            &mut self.ap,
+            &mut self.bp,
+        );
+        for i in 0..m * n {
+            self.x[i] = NS_A * self.x[i] + self.t[i];
+        }
+    }
+}
+
 /// Ortogonaliza `g` [rows x cols] no lugar, por `steps` iteracoes.
 pub fn newton_schulz(g: &mut [f32], rows: usize, cols: usize, steps: usize, s: &mut NsScratch) {
     let (m, n, tr) = if rows <= cols {
@@ -43,15 +128,7 @@ pub fn newton_schulz(g: &mut [f32], rows: usize, cols: usize, steps: usize, s: &
         (cols, rows, true)
     };
     s.x.resize(m * n, 0.0);
-    if tr {
-        for i in 0..rows {
-            for j in 0..cols {
-                s.x[j * rows + i] = g[i * cols + j];
-            }
-        }
-    } else {
-        s.x.copy_from_slice(g);
-    }
+    load_maybe_t(g, &mut s.x, rows, cols, tr);
 
     let norm = s.x.iter().map(|v| v * v).sum::<f32>().sqrt() + 1e-7;
     let inv = 1.0 / norm;
@@ -61,36 +138,10 @@ pub fn newton_schulz(g: &mut [f32], rows: usize, cols: usize, steps: usize, s: &
     s.t.resize(m * n, 0.0);
 
     for _ in 0..steps {
-        // A = X X^T
-        gemm_small(
-            m, m, n, &s.x, false, &s.x, true, &mut s.a, false, &mut s.ap, &mut s.bp,
-        );
-        // AA = A A
-        gemm_small(
-            m, m, m, &s.a, false, &s.a, false, &mut s.aa, false, &mut s.ap, &mut s.bp,
-        );
-        // B = b A + c A A, reaproveitando o buffer de A
-        for i in 0..m * m {
-            s.a[i] = NS_B * s.a[i] + NS_C * s.aa[i];
-        }
-        // X <- a X + B X
-        gemm_small(
-            m, n, m, &s.a, false, &s.x, false, &mut s.t, false, &mut s.ap, &mut s.bp,
-        );
-        for i in 0..m * n {
-            s.x[i] = NS_A * s.x[i] + s.t[i];
-        }
+        s.quintic_step(m, n);
     }
 
-    if tr {
-        for i in 0..rows {
-            for j in 0..cols {
-                g[i * cols + j] = s.x[j * rows + i];
-            }
-        }
-    } else {
-        g.copy_from_slice(&s.x);
-    }
+    store_maybe_t(&s.x, g, rows, cols, tr);
 }
 
 pub struct Optim {

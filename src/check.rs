@@ -8,8 +8,9 @@
 use crate::model::ResNet;
 use crate::nn::{softmax_ce, Param, Tensor};
 use crate::rng::{rand_vec, Rng};
+use crate::tok::Tok;
 use crate::vit::{Cfg, Grads, Out, RustViT};
-use crate::{attn, gemm, loss, model, nn, norm, optim, tok, vit};
+use crate::{attn, gemm, loss, model, nn, norm, optim, vit};
 use std::sync::Arc;
 
 /// Derivada direcional: compara (L(x+ev)-L(x-ev))/2e com <g, v> numa direcao
@@ -97,68 +98,106 @@ macro_rules! check_params {
     }};
 }
 
+/// Produto interno de uma linha de A por uma coluna de B, respeitando as
+/// transposicoes. E a definicao do GEMM, escrita para ser obviamente correta e
+/// nao para ser rapida: e contra isso que o driver otimizado e conferido.
+fn dot(
+    k: usize,
+    m: usize,
+    n: usize,
+    a: &[f32],
+    at: bool,
+    b: &[f32],
+    bt: bool,
+    i: usize,
+    j: usize,
+) -> f32 {
+    let mut s = 0.0f32;
+    for p in 0..k {
+        let av = if at { a[p * m + i] } else { a[i * k + p] };
+        let bv = if bt { b[j * k + p] } else { b[p * n + j] };
+        s += av * bv;
+    }
+    s
+}
+
 fn naive_matmul(m: usize, n: usize, k: usize, a: &[f32], at: bool, b: &[f32], bt: bool) -> Vec<f32> {
     let mut c = vec![0.0f32; m * n];
     for i in 0..m {
         for j in 0..n {
-            let mut s = 0.0f32;
-            for p in 0..k {
-                let av = if at { a[p * m + i] } else { a[i * k + p] };
-                let bv = if bt { b[j * k + p] } else { b[p * n + j] };
-                s += av * bv;
-            }
-            c[i * n + j] = s;
+            c[i * n + j] = dot(k, m, n, a, at, b, bt, i, j);
         }
     }
     c
 }
 
-pub fn vitcheck(seed: u64) -> bool {
-    use attn::{CrossAttn, SelfAttn};
-    use norm::{DwConv3, LayerNorm, SeqPool, SwiGlu};
-    use tok::Tok;
-    let mut rng = Rng::new(seed ^ 0x1234);
-    let eps = gc_eps();
-    let mut all = true;
-    println!("gradcheck do rustvit (eps {eps}):");
+/// Maior erro absoluto entre dois vetores, relativo a escala do esperado.
+fn max_rel(want: &[f32], got: &[f32]) -> f32 {
+    want.iter()
+        .zip(got)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0f32, f32::max)
+        / want.iter().map(|v| v.abs()).fold(1e-6, f32::max)
+}
 
-    // 1. o GEMM novo contra o laco triplo escalar, nas quatro combinacoes
+/// O driver de GEMM contra o laco triplo escalar, nas quatro combinacoes de
+/// transposicao e em tres formas.
+fn gemmcheck(rng: &mut Rng) -> bool {
+    let mut all = true;
     for (m, n, k) in [(23usize, 37usize, 19usize), (64, 48, 96), (7, 16, 259)] {
         for at in [false, true] {
             for bt in [false, true] {
-                let a = rand_vec(m * k, &mut rng);
-                let b = rand_vec(k * n, &mut rng);
+                let a = rand_vec(m * k, rng);
+                let b = rand_vec(k * n, rng);
                 let want = naive_matmul(m, n, k, &a, at, &b, bt);
                 let mut got = vec![0.0f32; m * n];
                 gemm::matmul(m, n, k, &a, at, &b, bt, &mut got, false);
-                let err = want
-                    .iter()
-                    .zip(&got)
-                    .map(|(x, y)| (x - y).abs())
-                    .fold(0.0f32, f32::max)
-                    / want.iter().map(|v| v.abs()).fold(1e-6, f32::max);
-                all &= report(&format!("matmul {m}x{n}x{k} at{} bt{}", at as u8, bt as u8), err);
+                let tag = format!("matmul {m}x{n}x{k} at{} bt{}", at as u8, bt as u8);
+                all &= report(&tag, max_rel(&want, &got));
             }
         }
     }
+    all
+}
 
+pub fn vitcheck(seed: u64) -> bool {
+    let mut rng = Rng::new(seed ^ 0x1234);
+    let eps = gc_eps();
+    println!("gradcheck do rustvit (eps {eps}):");
+    let mut all = gemmcheck(&mut rng);
+
+    // Uma unica sequencia de tokens serve de fixture para todas as camadas: o
+    // que muda entre elas e a camada, nao a entrada.
     let (n, t, c) = (3usize, 9usize, 8usize);
     let mut x = Tok::zeros(n, t, c);
     x.d = rand_vec(n * t * c, &mut rng);
     let r = rand_vec(n * t * c, &mut rng);
-    let dot = |y: &Tok, r: &[f32]| y.d.iter().zip(r).map(|(a, b)| a * b).sum::<f32>();
 
+    all &= normcheck(&x, &r, eps, &mut rng);
+    all &= attncheck(&x, &r, n, c, eps, &mut rng);
+    all &= netcheck(seed, eps, &mut rng);
+    all
+}
+
+/// LayerNorm, SwiGLU, depthwise 3x3 e a reducao por atencao.
+fn normcheck(x: &Tok, r: &[f32], eps: f32, rng: &mut Rng) -> bool {
+    use norm::{DwConv3, LayerNorm, SeqPool, SwiGlu};
+    let (n, c) = (x.n, x.c);
+    let mut all = true;
+    let dot = |y: &Tok, r: &[f32]| y.d.iter().zip(r).map(|(a, b)| a * b).sum::<f32>();
+    let x = x.clone();
+    let r = r.to_vec();
     // 2. LayerNorm
     {
         let mut ln = LayerNorm::new(c);
-        ln.g.v = rand_vec(c, &mut rng).iter().map(|v| 1.0 + 0.2 * v).collect();
-        ln.b.v = rand_vec(c, &mut rng);
+        ln.g.v = rand_vec(c, rng).iter().map(|v| 1.0 + 0.2 * v).collect();
+        ln.b.v = rand_vec(c, rng);
         let mut dy = x.zero_like();
         dy.d.copy_from_slice(&r);
         let _ = ln.forward(&x, true);
         let dx = ln.backward(&dy);
         let mut xt = x.clone();
-        let e = dircheck(&x.d, &dx.d, eps, &mut rng, |v| {
+        let e = dircheck(&x.d, &dx.d, eps, rng, |v| {
             xt.d.copy_from_slice(v);
             dot(&ln.forward(&xt, true), &r)
         });
@@ -171,20 +210,20 @@ pub fn vitcheck(seed: u64) -> bool {
             "layernorm dparams",
             ln,
             eps,
-            &mut rng,
+            rng,
             dot(&ln.forward(&x, true), &r)
         );
     }
 
     // 3. SwiGLU
     {
-        let mut sw = SwiGlu::new(c, 16, 2, &mut rng);
+        let mut sw = SwiGlu::new(c, 16, 2, rng);
         let mut dy = x.zero_like();
         dy.d.copy_from_slice(&r);
         let _ = sw.forward(&x, true);
         let dx = sw.backward(&dy);
         let mut xt = x.clone();
-        let e = dircheck(&x.d, &dx.d, eps, &mut rng, |v| {
+        let e = dircheck(&x.d, &dx.d, eps, rng, |v| {
             xt.d.copy_from_slice(v);
             dot(&sw.forward(&xt, true), &r)
         });
@@ -197,21 +236,21 @@ pub fn vitcheck(seed: u64) -> bool {
             "swiglu dparams",
             sw,
             eps,
-            &mut rng,
+            rng,
             dot(&sw.forward(&x, true), &r)
         );
     }
 
     // 4. depthwise 3x3 channel-last
     {
-        let mut dw = DwConv3::new(c, 3, 3, &mut rng);
-        dw.b.v = rand_vec(c, &mut rng);
+        let mut dw = DwConv3::new(c, 3, 3, rng);
+        dw.b.v = rand_vec(c, rng);
         let mut dy = x.zero_like();
         dy.d.copy_from_slice(&r);
         let _ = dw.forward(&x, true);
         let dx = dw.backward(&dy);
         let mut xt = x.clone();
-        let e = dircheck(&x.d, &dx.d, eps, &mut rng, |v| {
+        let e = dircheck(&x.d, &dx.d, eps, rng, |v| {
             xt.d.copy_from_slice(v);
             dot(&dw.forward(&xt, true), &r)
         });
@@ -224,20 +263,20 @@ pub fn vitcheck(seed: u64) -> bool {
             "dwconv3x3 dparams",
             dw,
             eps,
-            &mut rng,
+            rng,
             dot(&dw.forward(&x, true), &r)
         );
     }
 
     // 5. SeqPool
     {
-        let mut sp = SeqPool::new(c, &mut rng);
-        let rz = rand_vec(n * c, &mut rng);
+        let mut sp = SeqPool::new(c, rng);
+        let rz = rand_vec(n * c, rng);
         let dotz = |z: &[f32]| z.iter().zip(&rz).map(|(a, b)| a * b).sum::<f32>();
         let _ = sp.forward(&x, true);
         let dx = sp.backward(&rz);
         let mut xt = x.clone();
-        let e = dircheck(&x.d, &dx.d, eps, &mut rng, |v| {
+        let e = dircheck(&x.d, &dx.d, eps, rng, |v| {
             xt.d.copy_from_slice(v);
             dotz(&sp.forward(&xt, true))
         });
@@ -245,26 +284,29 @@ pub fn vitcheck(seed: u64) -> bool {
         zero_grads!(sp);
         let _ = sp.forward(&x, true);
         let _ = sp.backward(&rz);
-        check_params!(
-            all,
-            "seqpool dparams",
-            sp,
-            eps,
-            &mut rng,
-            dotz(&sp.forward(&x, true))
-        );
+        check_params!(all, "seqpool dparams", sp, eps, rng, dotz(&sp.forward(&x, true)));
     }
 
+    all
+}
+
+/// Auto-atencao, atencao cruzada e o bloco completo do rustvit.
+fn attncheck(x: &Tok, r: &[f32], n: usize, c: usize, eps: f32, rng: &mut Rng) -> bool {
+    use attn::{CrossAttn, SelfAttn};
+    let mut all = true;
+    let dot = |y: &Tok, r: &[f32]| y.d.iter().zip(r).map(|(a, b)| a * b).sum::<f32>();
+    let x = x.clone();
+    let r = r.to_vec();
     // 6. auto-atencao com LSA e vies relativo
     {
-        let mut at = SelfAttn::new(c, 2, 3, 3, 2, &mut rng);
-        at.rel.v = rand_vec(at.rel.v.len(), &mut rng);
+        let mut at = SelfAttn::new(c, 2, 3, 3, 2, rng);
+        at.rel.v = rand_vec(at.rel.v.len(), rng);
         let mut dy = x.zero_like();
         dy.d.copy_from_slice(&r);
         let _ = at.forward(&x, true);
         let dx = at.backward(&dy);
         let mut xt = x.clone();
-        let e = dircheck(&x.d, &dx.d, eps, &mut rng, |v| {
+        let e = dircheck(&x.d, &dx.d, eps, rng, |v| {
             xt.d.copy_from_slice(v);
             dot(&at.forward(&xt, true), &r)
         });
@@ -277,7 +319,7 @@ pub fn vitcheck(seed: u64) -> bool {
             "selfattn dparams",
             at,
             eps,
-            &mut rng,
+            rng,
             dot(&at.forward(&x, true), &r)
         );
     }
@@ -285,21 +327,21 @@ pub fn vitcheck(seed: u64) -> bool {
     // 7. atencao cruzada na memoria de alta resolucao
     {
         let (mh, mw) = (6usize, 6usize);
-        let mut cr = CrossAttn::new(c, 2, 3, 3, mh, mw, 2, &mut rng);
-        cr.rel.v = rand_vec(cr.rel.v.len(), &mut rng);
-        let mem = rand_vec(n * mh * mw * 2 * c, &mut rng);
+        let mut cr = CrossAttn::new(c, 2, 3, 3, mh, mw, 2, rng);
+        cr.rel.v = rand_vec(cr.rel.v.len(), rng);
+        let mem = rand_vec(n * mh * mw * 2 * c, rng);
         let mut dy = x.zero_like();
         dy.d.copy_from_slice(&r);
         let mut dmem = vec![0.0f32; mem.len()];
         let _ = cr.forward(&x, &mem, true);
         let dx = cr.backward(&dy, &mem, &mut dmem);
         let mut xt = x.clone();
-        let e = dircheck(&x.d, &dx.d, eps, &mut rng, |v| {
+        let e = dircheck(&x.d, &dx.d, eps, rng, |v| {
             xt.d.copy_from_slice(v);
             dot(&cr.forward(&xt, &mem, true), &r)
         });
         all &= report("crossattn dx", e);
-        let e = dircheck(&mem, &dmem, eps, &mut rng, |v| dot(&cr.forward(&x, v, true), &r));
+        let e = dircheck(&mem, &dmem, eps, rng, |v| dot(&cr.forward(&x, v, true), &r));
         all &= report("crossattn dmem", e);
         let mut dm2 = vec![0.0f32; mem.len()];
         zero_grads!(cr);
@@ -310,7 +352,7 @@ pub fn vitcheck(seed: u64) -> bool {
             "crossattn dparams",
             cr,
             eps,
-            &mut rng,
+            rng,
             dot(&cr.forward(&x, &mem, true), &r)
         );
     }
@@ -318,18 +360,18 @@ pub fn vitcheck(seed: u64) -> bool {
     // 8. bloco completo, com memoria e stochastic depth de semente fixa
     {
         let (mh, mw) = (6usize, 6usize);
-        let mut blk = vit::Block::new(c, 2, 3, 3, Some((mh, mw)), 2, 0.2, 7, 0.3, &mut rng);
+        let mut blk = vit::Block::new(c, 2, 3, 3, Some((mh, mw)), 2, 0.2, 7, 0.3, rng);
         blk.for_each_param(&mut |p| {
             p.v.iter_mut().for_each(|v| *v += 0.2 * rng.normal());
         });
-        let mem = rand_vec(n * mh * mw * 2 * c, &mut rng);
+        let mem = rand_vec(n * mh * mw * 2 * c, rng);
         let mut dmem = vec![0.0f32; mem.len()];
         let mut dy = x.zero_like();
         dy.d.copy_from_slice(&r);
         let _ = blk.forward(x.clone(), Some(&mem), true, 99);
         let dx = blk.backward(dy.clone(), Some(&mem), Some(&mut dmem));
         let mut xt = x.clone();
-        let e = dircheck(&x.d, &dx.d, eps, &mut rng, |v| {
+        let e = dircheck(&x.d, &dx.d, eps, rng, |v| {
             xt.d.copy_from_slice(v);
             dot(&blk.forward(xt.clone(), Some(&mem), true, 99), &r)
         });
@@ -343,12 +385,17 @@ pub fn vitcheck(seed: u64) -> bool {
             "block dparams",
             blk,
             eps,
-            &mut rng,
+            rng,
             dot(&blk.forward(x.clone(), Some(&mem), true, 99), &r)
         );
     }
 
-    // 9. rede inteira, todos os parametros de uma vez
+    all
+}
+
+/// A rede inteira, todos os parametros de uma vez.
+fn netcheck(seed: u64, eps: f32, rng: &mut Rng) -> bool {
+    let mut all = true;
     {
         let parent: Vec<u32> = vec![0, 0, 1, 1, 2, 2];
         let cfg = Cfg {
@@ -370,17 +417,17 @@ pub fn vitcheck(seed: u64) -> bool {
         net.for_each_param(&mut |p| p.v.iter_mut().for_each(|v| *v += 0.15 * rng.normal()));
         let bs = 3usize;
         let mut x0 = Tensor::zeros(bs, 3, 16, 16);
-        x0.d = rand_vec(bs * 3 * 16 * 16, &mut rng);
+        x0.d = rand_vec(bs * 3 * 16 * 16, rng);
         let xa = Arc::new(x0);
 
         let g = Grads {
-            logits: rand_vec(bs * nf, &mut rng),
-            coarse: rand_vec(bs * 3, &mut rng),
-            e1: rand_vec(bs * nf, &mut rng),
-            e2: rand_vec(bs * nf, &mut rng),
-            h1: rand_vec(bs * 12, &mut rng),
-            h2: rand_vec(bs * 12, &mut rng),
-            hfinal: rand_vec(bs * 12, &mut rng),
+            logits: rand_vec(bs * nf, rng),
+            coarse: rand_vec(bs * 3, rng),
+            e1: rand_vec(bs * nf, rng),
+            e2: rand_vec(bs * nf, rng),
+            h1: rand_vec(bs * 12, rng),
+            h2: rand_vec(bs * 12, rng),
+            hfinal: rand_vec(bs * 12, rng),
         };
         // A perda e a forma linear <saida, g>, entao dL/dsaida = g exatamente.
         // Isso exercita as tres cabecas, os dois hints e a memoria de uma vez.
@@ -402,38 +449,50 @@ pub fn vitcheck(seed: u64) -> bool {
             "rustvit completo (todos)",
             net,
             eps,
-            &mut rng,
+            rng,
             lin(&net.forward(&xa, true), &g)
         );
     }
 
-    // 10. Newton-Schulz: as saidas devem ter valores singulares perto de 1,
-    //     o que equivale a X^T X proximo da identidade.
-    {
-        for (m, n) in [(12usize, 20usize), (20, 12), (16, 16)] {
-            let mut g = rand_vec(m * n, &mut rng);
-            optim::newton_schulz(&mut g, m, n, 5, &mut optim::NsScratch::default());
-            let k = m.min(n);
-            let mut err = 0.0f32;
-            for i in 0..k {
-                for j in 0..k {
-                    let mut s = 0.0f32;
-                    for p in 0..m.max(n) {
-                        let (a, b) = if m <= n {
-                            (g[i * n + p], g[j * n + p])
-                        } else {
-                            (g[p * n + i], g[p * n + j])
-                        };
-                        s += a * b;
-                    }
-                    err = err.max((s - if i == j { 1.0 } else { 0.0 }).abs());
-                }
+    all &= nscheck(rng);
+    all
+}
+
+/// Newton-Schulz: as saidas devem ter valores singulares perto de 1, o que
+/// equivale a `X^T X` proximo da identidade.
+/// Maior desvio de `X^T X` (ou `X X^T`, o que for quadrado no lado menor) em
+/// relacao a identidade.
+fn gram_error(g: &[f32], m: usize, n: usize) -> f32 {
+    let k = m.min(n);
+    let mut err = 0.0f32;
+    for i in 0..k {
+        for j in 0..k {
+            let mut s = 0.0f32;
+            for p in 0..m.max(n) {
+                let (a, b) = if m <= n {
+                    (g[i * n + p], g[j * n + p])
+                } else {
+                    (g[p * n + i], g[p * n + j])
+                };
+                s += a * b;
             }
-            // O quintico do Muon e deliberadamente relaxado: os valores
-            // singulares ficam numa banda em torno de 1, nao exatamente em 1.
-            // O que precisa valer e que nenhum saia da banda.
-            all &= report_tol(&format!("newton-schulz {m}x{n} banda"), err, 0.5);
+            let alvo = if i == j { 1.0 } else { 0.0 };
+            err = err.max((s - alvo).abs());
         }
+    }
+    err
+}
+
+fn nscheck(rng: &mut Rng) -> bool {
+    let mut all = true;
+    for (m, n) in [(12usize, 20usize), (20, 12), (16, 16)] {
+        let mut g = rand_vec(m * n, rng);
+        optim::newton_schulz(&mut g, m, n, 5, &mut optim::NsScratch::default());
+        // O quintico do Muon e deliberadamente relaxado: os valores singulares
+        // ficam numa banda em torno de 1, nao exatamente em 1. O que precisa
+        // valer e que nenhum saia da banda.
+        let tag = format!("newton-schulz {m}x{n} banda");
+        all &= report_tol(&tag, gram_error(&g, m, n), 0.5);
     }
     all
 }

@@ -296,67 +296,87 @@ impl BatchNorm2d {
         self.run(x, train, true)
     }
 
-    fn run(&mut self, x: Tensor, train: bool, relu: bool) -> Tensor {
-        let (n, c, h, w) = (x.n, x.c, x.h, x.w);
+    /// Media e variancia do lote por canal. Acumula em f64 porque a soma de
+    /// n*h*w termos em f32 perde digitos suficientes para deslocar a variancia.
+    fn batch_stats(y: &Tensor, n: usize, c: usize, hw: usize, m: f32) -> (Vec<f32>, Vec<f32>) {
+        let mut mean = vec![0.0f32; c];
+        let mut var = vec![0.0f32; c];
+        mean.par_iter_mut()
+            .zip(var.par_iter_mut())
+            .enumerate()
+            .for_each(|(ci, (mu, va))| {
+                let (mut s, mut s2) = (0.0f64, 0.0f64);
+                for i in 0..n {
+                    let base = i * c * hw + ci * hw;
+                    for p in 0..hw {
+                        let v = y.d[base + p] as f64;
+                        s += v;
+                        s2 += v * v;
+                    }
+                }
+                let mu_ = s / m as f64;
+                *mu = mu_ as f32;
+                *va = (s2 / m as f64 - mu_ * mu_).max(0.0) as f32;
+            });
+        (mean, var)
+    }
+
+    /// Normaliza pelas estatisticas do lote, guarda `xhat` para o backward e
+    /// atualiza as medias correntes.
+    fn run_train(&mut self, y: &mut Tensor, n: usize, c: usize, h: usize, w: usize, relu: bool) {
         let hw = h * w;
         let m = (n * hw) as f32;
-        let mut y = x;
-
-        if train {
-            let mut mean = vec![0.0f32; c];
-            let mut var = vec![0.0f32; c];
-            mean.par_iter_mut()
-                .zip(var.par_iter_mut())
-                .enumerate()
-                .for_each(|(ci, (mu, va))| {
-                    let (mut s, mut s2) = (0.0f64, 0.0f64);
-                    for i in 0..n {
-                        let base = i * c * hw + ci * hw;
-                        for p in 0..hw {
-                            let v = y.d[base + p] as f64;
-                            s += v;
-                            s2 += v * v;
-                        }
-                    }
-                    let mu_ = s / m as f64;
-                    *mu = mu_ as f32;
-                    *va = (s2 / m as f64 - mu_ * mu_).max(0.0) as f32;
-                });
-            for ci in 0..c {
-                self.invstd[ci] = 1.0 / (var[ci] + self.eps).sqrt();
-                self.rm[ci] = (1.0 - self.mom) * self.rm[ci] + self.mom * mean[ci];
-                // variancia sem vies para as estatisticas de inferencia
-                let unb = var[ci] * m / (m - 1.0).max(1.0);
-                self.rv[ci] = (1.0 - self.mom) * self.rv[ci] + self.mom * unb;
-            }
-            let (gv, bv, ist) = (&self.g.v, &self.b.v, &self.invstd);
-            self.xhat.resize(n, c, h, w);
-            self.xhat
-                .d
-                .par_chunks_mut(hw)
-                .zip(y.d.par_chunks_mut(hw))
-                .enumerate()
-                .for_each(|(idx, (xh_, yc))| {
-                    let ci = idx % c;
-                    let (mu, is, g, b) = (mean[ci], ist[ci], gv[ci], bv[ci]);
-                    for p in 0..hw {
-                        let xh = (yc[p] - mu) * is;
-                        xh_[p] = xh;
-                        let v = g * xh + b;
-                        yc[p] = if relu { v.max(0.0) } else { v };
-                    }
-                });
-        } else {
-            let (gv, bv, rm, rv, eps) = (&self.g.v, &self.b.v, &self.rm, &self.rv, self.eps);
-            y.d.par_chunks_mut(hw).enumerate().for_each(|(idx, yc)| {
+        let (mean, var) = Self::batch_stats(y, n, c, hw, m);
+        for ci in 0..c {
+            self.invstd[ci] = 1.0 / (var[ci] + self.eps).sqrt();
+            self.rm[ci] = (1.0 - self.mom) * self.rm[ci] + self.mom * mean[ci];
+            // variancia sem vies para as estatisticas de inferencia
+            let unb = var[ci] * m / (m - 1.0).max(1.0);
+            self.rv[ci] = (1.0 - self.mom) * self.rv[ci] + self.mom * unb;
+        }
+        let (gv, bv, ist) = (&self.g.v, &self.b.v, &self.invstd);
+        self.xhat.resize(n, c, h, w);
+        self.xhat
+            .d
+            .par_chunks_mut(hw)
+            .zip(y.d.par_chunks_mut(hw))
+            .enumerate()
+            .for_each(|(idx, (xh_, yc))| {
                 let ci = idx % c;
-                let is = 1.0 / (rv[ci] + eps).sqrt();
-                let (sc, sh) = (gv[ci] * is, bv[ci] - gv[ci] * is * rm[ci]);
+                let (mu, is, g, b) = (mean[ci], ist[ci], gv[ci], bv[ci]);
                 for p in 0..hw {
-                    let v = sc * yc[p] + sh;
+                    let xh = (yc[p] - mu) * is;
+                    xh_[p] = xh;
+                    let v = g * xh + b;
                     yc[p] = if relu { v.max(0.0) } else { v };
                 }
             });
+    }
+
+    /// Na inferencia a normalizacao inteira vira uma escala e um deslocamento
+    /// por canal, calculados uma vez fora do laco de pixels.
+    fn run_eval(&self, y: &mut Tensor, c: usize, hw: usize, relu: bool) {
+        let (gv, bv, rm, rv, eps) = (&self.g.v, &self.b.v, &self.rm, &self.rv, self.eps);
+        y.d.par_chunks_mut(hw).enumerate().for_each(|(idx, yc)| {
+            let ci = idx % c;
+            let is = 1.0 / (rv[ci] + eps).sqrt();
+            let (sc, sh) = (gv[ci] * is, bv[ci] - gv[ci] * is * rm[ci]);
+            for p in 0..hw {
+                let v = sc * yc[p] + sh;
+                yc[p] = if relu { v.max(0.0) } else { v };
+            }
+        });
+    }
+
+    fn run(&mut self, x: Tensor, train: bool, relu: bool) -> Tensor {
+        let (n, c, h, w) = (x.n, x.c, x.h, x.w);
+        let hw = h * w;
+        let mut y = x;
+
+        if train {
+            self.run_train(&mut y, n, c, h, w, relu);
+        } else {
+            self.run_eval(&mut y, c, hw, relu);
         }
         y
     }
@@ -499,10 +519,10 @@ impl Linear {
         y
     }
 
-    /// dy: [n, fout] -> dx: [n, fin, 1, 1]
-    pub fn backward(&mut self, dy: &[f32]) -> Tensor {
-        let n = self.n;
-        for i in 0..n {
+    /// dW e db. O gradiente vindo do softmax e esparso quando o batch e grande
+    /// e a saida tem cem classes, entao pular o zero se paga.
+    fn backward_w(&mut self, dy: &[f32]) {
+        for i in 0..self.n {
             for o in 0..self.fout {
                 let g = dy[i * self.fout + o];
                 if g == 0.0 {
@@ -516,8 +536,11 @@ impl Linear {
                 }
             }
         }
-        let mut dx = Tensor::zeros(n, self.fin, 1, 1);
-        for i in 0..n {
+    }
+
+    fn backward_x(&self, dy: &[f32]) -> Tensor {
+        let mut dx = Tensor::zeros(self.n, self.fin, 1, 1);
+        for i in 0..self.n {
             let dxr = &mut dx.d[i * self.fin..(i + 1) * self.fin];
             for o in 0..self.fout {
                 let g = dy[i * self.fout + o];
@@ -532,12 +555,63 @@ impl Linear {
         }
         dx
     }
+
+    /// dy: [n, fout] -> dx: [n, fin, 1, 1]
+    pub fn backward(&mut self, dy: &[f32]) -> Tensor {
+        self.backward_w(dy);
+        self.backward_x(dy)
+    }
 }
 
 // ---------------------------------------------------------------- loss
 
 /// Softmax + cross-entropy com label smoothing. Retorna (loss media, acertos)
 /// e escreve o gradiente ja dividido pelo batch em `dlogits`.
+/// Maximo e seu indice, numa passada. O maximo estabiliza a exponencial e o
+/// indice e a predicao.
+#[inline]
+fn argmax(z: &[f32]) -> (f32, usize) {
+    let mut mx = f32::NEG_INFINITY;
+    let mut arg = 0usize;
+    for (j, &v) in z.iter().enumerate() {
+        if v > mx {
+            mx = v;
+            arg = j;
+        }
+    }
+    (mx, arg)
+}
+
+/// Uma linha do softmax + cross-entropy. Escreve o gradiente em `d` e devolve
+/// a perda daquele exemplo. `mx` vem de fora para nao percorrer `z` duas vezes.
+#[inline]
+fn softmax_ce_row(z: &[f32], y: usize, mx: f32, smooth: f32, inv: f32, d: &mut [f32]) -> f32 {
+    let nclass = z.len();
+    let mut sum = 0.0f32;
+    for j in 0..nclass {
+        let e = (z[j] - mx).exp();
+        d[j] = e;
+        sum += e;
+    }
+    let lse = mx + sum.ln();
+    // alvo suavizado
+    let on = 1.0 - smooth;
+    let off = smooth / nclass as f32;
+    let mut loss = on * (lse - z[y]);
+    if smooth > 0.0 {
+        let mut s = 0.0;
+        for j in 0..nclass {
+            s += lse - z[j];
+        }
+        loss += off * s;
+    }
+    for j in 0..nclass {
+        let t = if j == y { on + off } else { off };
+        d[j] = (d[j] / sum - t) * inv;
+    }
+    loss
+}
+
 pub fn softmax_ce(
     logits: &[f32],
     labels: &[u32],
@@ -552,40 +626,12 @@ pub fn softmax_ce(
     for i in 0..n {
         let z = &logits[i * nclass..(i + 1) * nclass];
         let d = &mut dlogits[i * nclass..(i + 1) * nclass];
-        let mut mx = f32::NEG_INFINITY;
-        let mut arg = 0usize;
-        for (j, &v) in z.iter().enumerate() {
-            if v > mx {
-                mx = v;
-                arg = j;
-            }
-        }
-        let mut sum = 0.0f32;
-        for j in 0..nclass {
-            let e = (z[j] - mx).exp();
-            d[j] = e;
-            sum += e;
-        }
-        let lse = mx + sum.ln();
         let y = labels[i] as usize;
+        let (mx, arg) = argmax(z);
         if arg == y {
             correct += 1;
         }
-        // alvo suavizado
-        let on = 1.0 - smooth;
-        let off = smooth / nclass as f32;
-        loss += on * (lse - z[y]);
-        if smooth > 0.0 {
-            let mut s = 0.0;
-            for j in 0..nclass {
-                s += lse - z[j];
-            }
-            loss += off * s;
-        }
-        for j in 0..nclass {
-            let t = if j == y { on + off } else { off };
-            d[j] = (d[j] / sum - t) * inv;
-        }
+        loss += softmax_ce_row(z, y, mx, smooth, inv, d);
     }
     (loss * inv, correct)
 }

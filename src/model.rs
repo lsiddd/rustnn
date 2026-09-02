@@ -1,7 +1,9 @@
 //! ResNet estilo CIFAR: stem 3x3 + 3 estagios de blocos residuais + GAP + FC.
 
 use crate::ckpt;
-use crate::nn::*;
+use crate::nn::{
+    add_, add_relu_, gap_backward, gap_forward, relu_back_, BatchNorm2d, Conv2d, Linear, Param, Tensor,
+};
 use crate::rng::Rng;
 use std::sync::Arc;
 

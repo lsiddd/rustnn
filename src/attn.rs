@@ -18,23 +18,44 @@ use crate::rng::Rng;
 use crate::tok::Tok;
 use rayon::prelude::*;
 
+/// Forma da tabela de vies: extensao dos deslocamentos, passo entre a grade de
+/// consulta e a de memoria, e a origem que leva o deslocamento minimo a zero.
+struct RelGeom {
+    span: (usize, usize),
+    scale: isize,
+    origin: (isize, isize),
+}
+
+impl RelGeom {
+    fn new(th: usize, tw: usize, mh: usize, mw: usize) -> RelGeom {
+        // Grades iguais: auto-atencao, deslocamento de -(th-1) a th-1.
+        if mh == th {
+            return RelGeom {
+                span: (2 * th - 1, 2 * tw - 1),
+                scale: 1,
+                origin: (th as isize - 1, tw as isize - 1),
+            };
+        }
+        // Memoria com o dobro da resolucao: o deslocamento vale meio token.
+        RelGeom {
+            span: (2 * (th - 1) + mh, 2 * (tw - 1) + mw),
+            scale: 2,
+            origin: (mh as isize - 1, mw as isize - 1),
+        }
+    }
+}
+
 /// Tabela (i, j) -> indice do vies posicional relativo, montada uma vez.
 ///
 /// Para a auto-atencao as duas grades sao iguais e o deslocamento vai de
 /// `-(th-1)` a `th-1`. Para a atencao cruzada a grade da memoria tem o dobro da
 /// resolucao, entao o deslocamento e medido em meio token: `2*qy - my`.
 fn rel_index(th: usize, tw: usize, mh: usize, mw: usize) -> (Vec<u32>, usize) {
-    let (sy, sx) = if mh == th {
-        (2 * th - 1, 2 * tw - 1)
-    } else {
-        (2 * (th - 1) + mh, 2 * (tw - 1) + mw)
-    };
-    let scale = if mh == th { 1isize } else { 2 };
-    let (oy, ox) = if mh == th {
-        (th as isize - 1, tw as isize - 1)
-    } else {
-        (mh as isize - 1, mw as isize - 1)
-    };
+    let RelGeom {
+        span: (sy, sx),
+        scale,
+        origin: (oy, ox),
+    } = RelGeom::new(th, tw, mh, mw);
     let mut idx = Vec::with_capacity(th * tw * mh * mw);
     for qy in 0..th as isize {
         for qx in 0..tw as isize {
