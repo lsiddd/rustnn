@@ -1,6 +1,6 @@
 //! Formato de checkpoint compartilhado pelas duas arquiteturas.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
 
@@ -56,20 +56,29 @@ pub fn save(
     layout: Layout,
     mut visit: impl FnMut(&mut dyn FnMut(&[f32])),
 ) -> io::Result<()> {
-    let mut file = BufWriter::new(File::create(path)?);
-    file.write_all(MAGIC)?;
-    file.write_all(&layout.tensors.to_le_bytes())?;
-    file.write_all(&layout.scalars.to_le_bytes())?;
-    file.write_all(&layout.config_hash.to_le_bytes())?;
+    let temporary = format!("{path}.tmp");
+    let result = (|| {
+        let mut file = BufWriter::new(File::create(&temporary)?);
+        file.write_all(MAGIC)?;
+        file.write_all(&layout.tensors.to_le_bytes())?;
+        file.write_all(&layout.scalars.to_le_bytes())?;
+        file.write_all(&layout.config_hash.to_le_bytes())?;
 
-    let mut result = Ok(());
-    visit(&mut |values| {
-        if result.is_ok() {
-            result = write_f32s(&mut file, values);
-        }
-    });
-    result?;
-    file.flush()
+        let mut result = Ok(());
+        visit(&mut |values| {
+            if result.is_ok() {
+                result = write_f32s(&mut file, values);
+            }
+        });
+        result?;
+        file.flush()?;
+        file.get_ref().sync_all()
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_file(&temporary);
+        return Err(error);
+    }
+    fs::rename(temporary, path)
 }
 
 pub fn load(
