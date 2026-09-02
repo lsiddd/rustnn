@@ -64,6 +64,7 @@ struct Config {
     gradcheck: bool,
     bench: usize,
     gemmbench: bool,
+    fingerprint: usize,
     // rustvit
     dim: usize,
     heads: usize,
@@ -123,6 +124,7 @@ impl Default for Config {
             gradcheck: false,
             bench: 0,
             gemmbench: false,
+            fingerprint: 0,
             dim: 256,
             heads: 4,
             depth3: 5,
@@ -176,6 +178,7 @@ USO: rustnn [opcoes]
   --eval             so avalia (use com --resume)
   --gradcheck        checagem numerica do backward e sai
   --bench <n>        cronometra n steps de treino e sai
+  --fingerprint <n>  treina n steps em uma thread e imprime FNV-1a
 
  arquitetura (rustvit)
   --dim <n>          largura do estagio S3             (256)
@@ -262,6 +265,7 @@ fn parse() -> Config {
             "--gradcheck" => c.gradcheck = true,
             "--bench" => c.bench = next!().parse().unwrap(),
             "--gemmbench" => c.gemmbench = true,
+            "--fingerprint" => c.fingerprint = next!().parse().unwrap(),
             "--dim" => c.dim = next!().parse().unwrap(),
             "--heads" => c.heads = next!().parse().unwrap(),
             "--depth3" => c.depth3 = next!().parse().unwrap(),
@@ -565,6 +569,104 @@ fn gemmbench() {
     }
 }
 
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv_f32(mut hash: u64, value: f32) -> u64 {
+    for byte in value.to_bits().to_le_bytes() {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// Executa o prefixo do treino real em uma unica thread. O hash inclui os
+/// parametros na ordem de `for_each_param` e a ultima perda total.
+fn fingerprint(cfg: &Config, train: &data::Dataset, taxo: &data::Taxo, ntrain: usize) {
+    assert!(cfg.fingerprint > 0);
+    assert!(
+        ntrain >= cfg.batch,
+        "--fingerprint requer ao menos um batch completo"
+    );
+
+    let mut net = RustViT::new(make_cfg(cfg), taxo.parent.clone(), taxo.ncoarse, cfg.seed);
+    net.use_exits = !cfg.no_exits;
+    let mut opt = optim::Optim::new(cfg.muon, cfg.ns);
+    let mut rng = Rng::new(cfg.seed ^ 0xABCD);
+    let mut order: Vec<usize> = (0..ntrain).collect();
+    let mut x = Arc::new(Tensor::zeros(cfg.batch, 3, IMG, IMG));
+    let mut labels = vec![0u32; cfg.batch];
+    let mut dom = vec![0u32; cfg.batch];
+    let mut coarse = vec![0u32; cfg.batch];
+    let mut tf = vec![0.0f32; cfg.batch * NCLASS];
+    let mut tc = vec![0.0f32; cfg.batch * taxo.ncoarse];
+    let steps_per_epoch = ntrain / cfg.batch;
+    let total_steps = steps_per_epoch * cfg.epochs;
+    let warm_steps = steps_per_epoch * cfg.warmup;
+    let mut last_loss = f32::NAN;
+
+    for step in 0..cfg.fingerprint {
+        let b = step % steps_per_epoch;
+        let epoch = step / steps_per_epoch;
+        if b == 0 {
+            rng.shuffle(&mut order);
+        }
+        let (aug, amix, acut) = aug_at(cfg, epoch);
+        let idx = &order[b * cfg.batch..(b + 1) * cfg.batch];
+        let (perm, lam) = {
+            let xm = Arc::make_mut(&mut x);
+            data::make_batch_train(
+                train,
+                idx,
+                &aug,
+                rng.next_u64(),
+                &mut xm.d[..cfg.batch * PIX],
+                &mut labels,
+                &mut coarse,
+            );
+            data::mix_batch(&mut xm.d, cfg.batch, amix, acut, 0.5, &mut rng)
+        };
+        targets(&labels, &coarse, &perm, &lam, taxo, cfg, &mut tf, &mut tc);
+        for i in 0..cfg.batch {
+            dom[i] = if lam[i] >= 0.5 { labels[i] } else { labels[perm[i]] };
+        }
+
+        net.drop_seed = rng.next_u64();
+        let out = net.forward(&x, true);
+        let loss = build_loss(
+            &out,
+            &tf,
+            &tc,
+            &dom,
+            &coarse,
+            cfg,
+            NCLASS,
+            taxo.ncoarse,
+            cfg.batch,
+        );
+        last_loss = loss.total;
+        net.backward(&loss.g);
+
+        let mut params: Vec<&mut Param> = Vec::new();
+        net.for_each_param(&mut |p| params.push(unsafe { &mut *(p as *mut Param) }));
+        if cfg.clip > 0.0 {
+            optim::clip_(&mut params, cfg.clip);
+        }
+        let lr = lr_at(cfg.lr, cfg.lr_min, step, total_steps, warm_steps);
+        opt.step_all(&mut params, lr, cfg.wd);
+        opt.t += 1;
+    }
+
+    let mut hash = FNV_OFFSET;
+    net.for_each_param(&mut |p| {
+        for &value in &p.v {
+            hash = fnv_f32(hash, value);
+        }
+    });
+    hash = fnv_f32(hash, last_loss);
+    println!("fingerprint: {hash:016x} | loss {last_loss:.9}");
+}
+
 fn main() {
     let cfg = parse();
     if cfg.gemmbench {
@@ -580,9 +682,10 @@ fn main() {
         let ok = layercheck(cfg.seed) & vitcheck(cfg.seed) & gradcheck(cfg.seed);
         std::process::exit(if ok { 0 } else { 1 });
     }
-    if cfg.threads > 0 {
+    let threads = if cfg.fingerprint > 0 { 1 } else { cfg.threads };
+    if threads > 0 {
         rayon::ThreadPoolBuilder::new()
-            .num_threads(cfg.threads)
+            .num_threads(threads)
             .build_global()
             .unwrap();
     }
@@ -604,6 +707,10 @@ fn main() {
     } else {
         train.len
     };
+
+    if cfg.fingerprint > 0 {
+        return fingerprint(&cfg, &train, &taxo, ntrain);
+    }
 
     if cfg.arch == "resnet" {
         return run_resnet(&cfg, &train, &test, ntrain);
