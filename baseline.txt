@@ -1,0 +1,11 @@
+# Baseline local conservadora de release, 2026-09-02. GEMM usa o melhor de
+# tres amostras e estes valores sao o envelope inferior observado sem mudanca
+# de codigo. O portao aceita no maximo 3% de queda; ganhos nao sao regressao.
+fingerprint 9ad224b851c0077e
+bench_img_s 102.3
+gemm_s3_qkv_fwd 462.2
+gemm_s3_swiglu_wg 453.9
+gemm_s3_qkv_dx 373.7
+gemm_s3_qkv_dw 146.5
+gemm_s3_swiglu_wd 380.9
+gemm_merge_fwd 370.9
