@@ -64,3 +64,9 @@ impl Rng {
         }
     }
 }
+
+/// Vetor de normais padrao. Usado pelas checagens de gradiente e pelo
+/// `--gemmbench`, que precisam de entradas aleatorias mas reprodutiveis.
+pub fn rand_vec(n: usize, rng: &mut Rng) -> Vec<f32> {
+    (0..n).map(|_| rng.normal()).collect()
+}

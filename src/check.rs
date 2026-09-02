@@ -2,10 +2,10 @@
 // driver de GEMM: 50 checagens, todas comparando a derivada analitica com a
 // diferenca central.
 //
-// Vem por `include!` e nao por `mod` porque as checagens montam o modelo com os
-// mesmos `Config` e `make_cfg` do treino, que sao privados de `main.rs`: um
-// modulo separado exigiria torna-los publicos so para o teste, e a checagem
-// deixaria de exercitar exatamente o caminho que roda de verdade.
+// Ainda vem por `include!` e nao por `mod`, o que so custa: as checagens montam
+// `vit::Cfg` diretamente e nao dependem de nada privado de `main.rs`. Trocar por
+// `mod check` e um `#[cfg(test)] mod tests` faria `cargo test` rodar as 50
+// checagens, hoje acessiveis so pelo `--gradcheck`.
 
 /// Derivada direcional: compara (L(x+ev)-L(x-ev))/2e com <g, v> numa direcao
 /// aleatoria. Agrega o gradiente inteiro num numero so, entao o sinal fica bem
@@ -51,10 +51,6 @@ fn gc_eps() -> f32 {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3e-4)
-}
-
-fn rand_vec(n: usize, rng: &mut Rng) -> Vec<f32> {
-    (0..n).map(|_| rng.normal()).collect()
 }
 
 // ---------------------------------------------------------------- rustvit
