@@ -85,7 +85,8 @@ seção 3.2 é o padrão.
 As checagens e os cronômetros aceitam as duas arquiteturas.
 
 ```bash
-./target/release/rustnn --gradcheck                    # as cinquenta checagens
+cargo test --release                                  # as checagens como testes
+./target/release/rustnn --gradcheck                    # as mesmas, com a tabela
 ./target/release/rustnn --bench 15                     # vazão do rustvit
 ./target/release/rustnn --arch resnet --batch 128 --bench 20   # vazão da ResNet
 ./target/release/rustnn --gemmbench                    # GEMM por forma do modelo
@@ -500,7 +501,8 @@ trecho 60 a 70.
 A opção `--gradcheck` compara o gradiente analítico com a derivada direcional
 `(L(θ + εv) − L(θ − εv)) / 2ε`, tomada em uma direção aleatória `v`. A comparação é
 feita camada por camada e, em seguida, sobre todos os parâmetros de cada rede
-simultaneamente.
+simultaneamente. As mesmas checagens são o corpo de três `#[test]`, de modo que
+`cargo test` reprova a compilação se alguma delas falhar.
 
 A escolha da derivada direcional, em lugar da perturbação de pesos individuais, é o
 ponto central do procedimento. A derivada direcional agrega o gradiente inteiro em um

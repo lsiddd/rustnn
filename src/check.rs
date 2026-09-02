@@ -1,11 +1,16 @@
-// Verificacao numerica do backward de toda camada, do modelo inteiro e do
-// driver de GEMM: 50 checagens, todas comparando a derivada analitica com a
-// diferenca central.
-//
-// Ainda vem por `include!` e nao por `mod`, o que so custa: as checagens montam
-// `vit::Cfg` diretamente e nao dependem de nada privado de `main.rs`. Trocar por
-// `mod check` e um `#[cfg(test)] mod tests` faria `cargo test` rodar as 50
-// checagens, hoje acessiveis so pelo `--gradcheck`.
+//! Verificacao numerica do backward de toda camada, do modelo inteiro e do
+//! driver de GEMM: 50 checagens, todas comparando a derivada analitica com a
+//! diferenca central.
+//!
+//! Sao alcancaveis de dois jeitos: `--gradcheck`, que imprime a tabela toda, e
+//! `cargo test`, que reprova o build se qualquer uma falhar.
+
+use crate::model::ResNet;
+use crate::nn::{softmax_ce, Param, Tensor};
+use crate::rng::{rand_vec, Rng};
+use crate::vit::{Cfg, Grads, Out, RustViT};
+use crate::{attn, gemm, loss, model, nn, norm, optim, tok, vit};
+use std::sync::Arc;
 
 /// Derivada direcional: compara (L(x+ev)-L(x-ev))/2e com <g, v> numa direcao
 /// aleatoria. Agrega o gradiente inteiro num numero so, entao o sinal fica bem
@@ -108,7 +113,7 @@ fn naive_matmul(m: usize, n: usize, k: usize, a: &[f32], at: bool, b: &[f32], bt
     c
 }
 
-fn vitcheck(seed: u64) -> bool {
+pub fn vitcheck(seed: u64) -> bool {
     use attn::{CrossAttn, SelfAttn};
     use norm::{DwConv3, LayerNorm, SeqPool, SwiGlu};
     use tok::Tok;
@@ -161,7 +166,14 @@ fn vitcheck(seed: u64) -> bool {
         zero_grads!(ln);
         let _ = ln.forward(&x, true);
         let _ = ln.backward(&dy);
-        check_params!(all, "layernorm dparams", ln, eps, &mut rng, dot(&ln.forward(&x, true), &r));
+        check_params!(
+            all,
+            "layernorm dparams",
+            ln,
+            eps,
+            &mut rng,
+            dot(&ln.forward(&x, true), &r)
+        );
     }
 
     // 3. SwiGLU
@@ -180,7 +192,14 @@ fn vitcheck(seed: u64) -> bool {
         zero_grads!(sw);
         let _ = sw.forward(&x, true);
         let _ = sw.backward(&dy);
-        check_params!(all, "swiglu dparams", sw, eps, &mut rng, dot(&sw.forward(&x, true), &r));
+        check_params!(
+            all,
+            "swiglu dparams",
+            sw,
+            eps,
+            &mut rng,
+            dot(&sw.forward(&x, true), &r)
+        );
     }
 
     // 4. depthwise 3x3 channel-last
@@ -200,7 +219,14 @@ fn vitcheck(seed: u64) -> bool {
         zero_grads!(dw);
         let _ = dw.forward(&x, true);
         let _ = dw.backward(&dy);
-        check_params!(all, "dwconv3x3 dparams", dw, eps, &mut rng, dot(&dw.forward(&x, true), &r));
+        check_params!(
+            all,
+            "dwconv3x3 dparams",
+            dw,
+            eps,
+            &mut rng,
+            dot(&dw.forward(&x, true), &r)
+        );
     }
 
     // 5. SeqPool
@@ -219,7 +245,14 @@ fn vitcheck(seed: u64) -> bool {
         zero_grads!(sp);
         let _ = sp.forward(&x, true);
         let _ = sp.backward(&rz);
-        check_params!(all, "seqpool dparams", sp, eps, &mut rng, dotz(&sp.forward(&x, true)));
+        check_params!(
+            all,
+            "seqpool dparams",
+            sp,
+            eps,
+            &mut rng,
+            dotz(&sp.forward(&x, true))
+        );
     }
 
     // 6. auto-atencao com LSA e vies relativo
@@ -239,7 +272,14 @@ fn vitcheck(seed: u64) -> bool {
         zero_grads!(at);
         let _ = at.forward(&x, true);
         let _ = at.backward(&dy);
-        check_params!(all, "selfattn dparams", at, eps, &mut rng, dot(&at.forward(&x, true), &r));
+        check_params!(
+            all,
+            "selfattn dparams",
+            at,
+            eps,
+            &mut rng,
+            dot(&at.forward(&x, true), &r)
+        );
     }
 
     // 7. atencao cruzada na memoria de alta resolucao
@@ -259,15 +299,20 @@ fn vitcheck(seed: u64) -> bool {
             dot(&cr.forward(&xt, &mem, true), &r)
         });
         all &= report("crossattn dx", e);
-        let e = dircheck(&mem, &dmem, eps, &mut rng, |v| {
-            dot(&cr.forward(&x, v, true), &r)
-        });
+        let e = dircheck(&mem, &dmem, eps, &mut rng, |v| dot(&cr.forward(&x, v, true), &r));
         all &= report("crossattn dmem", e);
         let mut dm2 = vec![0.0f32; mem.len()];
         zero_grads!(cr);
         let _ = cr.forward(&x, &mem, true);
         let _ = cr.backward(&dy, &mem, &mut dm2);
-        check_params!(all, "crossattn dparams", cr, eps, &mut rng, dot(&cr.forward(&x, &mem, true), &r));
+        check_params!(
+            all,
+            "crossattn dparams",
+            cr,
+            eps,
+            &mut rng,
+            dot(&cr.forward(&x, &mem, true), &r)
+        );
     }
 
     // 8. bloco completo, com memoria e stochastic depth de semente fixa
@@ -293,7 +338,14 @@ fn vitcheck(seed: u64) -> bool {
         zero_grads!(blk);
         let _ = blk.forward(x.clone(), Some(&mem), true, 99);
         let _ = blk.backward(dy, Some(&mem), Some(&mut dm2));
-        check_params!(all, "block dparams", blk, eps, &mut rng, dot(&blk.forward(x.clone(), Some(&mem), true, 99), &r));
+        check_params!(
+            all,
+            "block dparams",
+            blk,
+            eps,
+            &mut rng,
+            dot(&blk.forward(x.clone(), Some(&mem), true, 99), &r)
+        );
     }
 
     // 9. rede inteira, todos os parametros de uma vez
@@ -345,7 +397,14 @@ fn vitcheck(seed: u64) -> bool {
         let out = net.forward(&xa, true);
         let _ = &out;
         net.backward(&g);
-        check_params!(all, "rustvit completo (todos)", net, eps, &mut rng, lin(&net.forward(&xa, true), &g));
+        check_params!(
+            all,
+            "rustvit completo (todos)",
+            net,
+            eps,
+            &mut rng,
+            lin(&net.forward(&xa, true), &g)
+        );
     }
 
     // 10. Newton-Schulz: as saidas devem ter valores singulares perto de 1,
@@ -382,7 +441,7 @@ fn vitcheck(seed: u64) -> bool {
 // ---------------------------------------------------------------- resnet
 
 /// Gradcheck por camada do caminho convolucional.
-fn layercheck(seed: u64) -> bool {
+pub fn layercheck(seed: u64) -> bool {
     use nn::{BatchNorm2d, Conv2d, Linear};
     let mut rng = Rng::new(seed);
     let eps = gc_eps();
@@ -409,7 +468,12 @@ fn layercheck(seed: u64) -> bool {
         let mut xt = Arc::new((*x).clone());
         let e = dircheck(&xb, &dx.d, eps, &mut rng, |c| {
             Arc::make_mut(&mut xt).d.copy_from_slice(c);
-            conv.forward(&xt, false).d.iter().zip(&r).map(|(a, b)| a * b).sum()
+            conv.forward(&xt, false)
+                .d
+                .iter()
+                .zip(&r)
+                .map(|(a, b)| a * b)
+                .sum()
         });
         all &= report(&format!("{tag} dx"), e);
 
@@ -440,14 +504,24 @@ fn layercheck(seed: u64) -> bool {
         let mut xt = x.clone();
         let e = dircheck(&xb, &dx.d, eps, &mut rng, |c| {
             xt.d.copy_from_slice(c);
-            bn.forward(xt.clone(), true).d.iter().zip(&r).map(|(a, b)| a * b).sum()
+            bn.forward(xt.clone(), true)
+                .d
+                .iter()
+                .zip(&r)
+                .map(|(a, b)| a * b)
+                .sum()
         });
         all &= report("batchnorm dx", e);
 
         let gb = bn.g.v.clone();
         let e = dircheck(&gb, &dg, eps, &mut rng, |c| {
             bn.g.v.copy_from_slice(c);
-            bn.forward(x.clone(), true).d.iter().zip(&r).map(|(a, b)| a * b).sum()
+            bn.forward(x.clone(), true)
+                .d
+                .iter()
+                .zip(&r)
+                .map(|(a, b)| a * b)
+                .sum()
         });
         bn.g.v.copy_from_slice(&gb);
         all &= report("batchnorm dgamma", e);
@@ -455,7 +529,12 @@ fn layercheck(seed: u64) -> bool {
         let bb = bn.b.v.clone();
         let e = dircheck(&bb, &db, eps, &mut rng, |c| {
             bn.b.v.copy_from_slice(c);
-            bn.forward(x.clone(), true).d.iter().zip(&r).map(|(a, b)| a * b).sum()
+            bn.forward(x.clone(), true)
+                .d
+                .iter()
+                .zip(&r)
+                .map(|(a, b)| a * b)
+                .sum()
         });
         bn.b.v.copy_from_slice(&bb);
         all &= report("batchnorm dbeta", e);
@@ -586,7 +665,7 @@ fn layercheck(seed: u64) -> bool {
 }
 
 /// Gradcheck da ResNet completa.
-fn gradcheck(seed: u64) -> bool {
+pub fn gradcheck(seed: u64) -> bool {
     const NC: usize = 10;
     const BS: usize = 8;
     let eps = gc_eps();
@@ -629,4 +708,28 @@ fn gradcheck(seed: u64) -> bool {
         off += n;
     });
     report("resnet completa (todos)", e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{gradcheck, layercheck, vitcheck};
+
+    /// A semente e a mesma do `--gradcheck` sem argumentos, entao um teste que
+    /// falha aqui reproduz com `rustnn --gradcheck`.
+    const SEED: u64 = 1234;
+
+    #[test]
+    fn camadas() {
+        assert!(layercheck(SEED));
+    }
+
+    #[test]
+    fn rustvit() {
+        assert!(vitcheck(SEED));
+    }
+
+    #[test]
+    fn modelos_completos() {
+        assert!(gradcheck(SEED));
+    }
 }

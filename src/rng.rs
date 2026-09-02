@@ -70,3 +70,49 @@ impl Rng {
 pub fn rand_vec(n: usize, rng: &mut Rng) -> Vec<f32> {
     (0..n).map(|_| rng.normal()).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Rng;
+
+    #[test]
+    fn mesma_semente_mesma_sequencia() {
+        let (mut a, mut b) = (Rng::new(1234), Rng::new(1234));
+        for _ in 0..1000 {
+            assert_eq!(a.next_u64(), b.next_u64());
+        }
+        assert_ne!(Rng::new(1).next_u64(), Rng::new(2).next_u64());
+    }
+
+    #[test]
+    fn uniform_no_intervalo() {
+        let mut rng = Rng::new(7);
+        for _ in 0..10_000 {
+            let x = rng.uniform();
+            assert!((0.0..1.0).contains(&x), "uniform devolveu {x}");
+        }
+    }
+
+    #[test]
+    fn below_no_intervalo() {
+        let mut rng = Rng::new(9);
+        for n in [1usize, 2, 7, 100] {
+            for _ in 0..1000 {
+                assert!(rng.below(n) < n);
+            }
+        }
+    }
+
+    /// O embaralhamento e uma permutacao: nenhum indice pode sumir nem
+    /// duplicar, porque `order` indexa o dataset.
+    #[test]
+    fn shuffle_e_permutacao() {
+        let mut rng = Rng::new(3);
+        let mut v: Vec<usize> = (0..500).collect();
+        rng.shuffle(&mut v);
+        let mut sorted = v.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..500).collect::<Vec<_>>());
+        assert_ne!(v, sorted, "500 elementos sairem em ordem seria suspeito");
+    }
+}

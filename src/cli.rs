@@ -303,6 +303,18 @@ pub fn parse() -> Config {
 /// Roda antes de ler o dataset e antes de alocar o modelo, e reporta todos os
 /// problemas de uma vez: corrigir um por execucao custa uma execucao por erro.
 pub fn validate(c: &Config) {
+    let bad = problems(c);
+    if !bad.is_empty() {
+        for m in &bad {
+            eprintln!("erro: {m}");
+        }
+        std::process::exit(1);
+    }
+}
+
+/// O corpo de [`validate`], separado para poder ser testado: uma funcao que
+/// chama `process::exit` nao tem como ser exercitada por `cargo test`.
+fn problems(c: &Config) -> Vec<String> {
     let mut bad: Vec<String> = Vec::new();
     // `if $cond {} else` e nao `if !($cond)`: negar uma comparacao de float
     // esconde o caso NaN, que aqui cai no ramo do erro de proposito.
@@ -416,10 +428,73 @@ pub fn validate(c: &Config) {
         need!(unit(x), "{flag} {x}: e uma fracao, precisa estar entre 0 e 1");
     }
 
-    if !bad.is_empty() {
-        for m in &bad {
-            eprintln!("erro: {m}");
+    bad
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{problems, Config};
+
+    fn erros(edit: impl FnOnce(&mut Config)) -> Vec<String> {
+        let mut c = Config::default();
+        edit(&mut c);
+        problems(&c)
+    }
+
+    #[test]
+    fn padrao_e_valido() {
+        assert!(problems(&Config::default()).is_empty());
+    }
+
+    /// `dh = c / h` em attn.rs trunca: sem divisibilidade as cabecas deixam de
+    /// cobrir a largura e os canais que sobram somem sem aviso.
+    #[test]
+    fn exige_divisibilidade_das_cabecas() {
+        assert_eq!(erros(|c| c.heads = 5).len(), 1);
+        assert_eq!(erros(|c| c.heads4 = 5).len(), 1);
+        assert!(erros(|c| {
+            c.dim = 252;
+            c.heads = 4;
+        })
+        .is_empty());
+    }
+
+    #[test]
+    fn recusa_batch_e_subset_impossiveis() {
+        assert!(!erros(|c| c.batch = 0).is_empty());
+        assert!(!erros(|c| c.subset = 10).is_empty());
+        assert!(erros(|c| c.subset = 0).is_empty());
+    }
+
+    #[test]
+    fn recusa_warmup_maior_que_o_treino() {
+        assert!(!erros(|c| c.warmup = 200).is_empty());
+        assert!(erros(|c| c.warmup = 100).is_empty());
+    }
+
+    #[test]
+    fn recusa_fracoes_fora_do_intervalo() {
+        for edit in [
+            |c: &mut Config| c.smooth = 1.5,
+            |c: &mut Config| c.erase = -0.1,
+            |c: &mut Config| c.droppath = f32::NAN,
+            |c: &mut Config| c.ema = 2.0,
+        ] {
+            assert!(!erros(edit).is_empty());
         }
-        std::process::exit(1);
+        // mixup e cutmix sao alphas de uma Beta: podem passar de um.
+        assert!(erros(|c| c.mixup = 4.0).is_empty());
+    }
+
+    /// Todos os problemas de uma vez, para nao gastar uma execucao por erro.
+    #[test]
+    fn reporta_tudo_de_uma_vez() {
+        let bad = erros(|c| {
+            c.arch = "xpto".into();
+            c.batch = 0;
+            c.heads = 5;
+            c.smooth = 3.0;
+        });
+        assert!(bad.len() >= 4, "esperava quatro ou mais, veio {bad:?}");
     }
 }

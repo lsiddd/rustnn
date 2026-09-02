@@ -245,3 +245,125 @@ fn read_u64(bytes: &[u8], offset: usize, field: &str) -> io::Result<u64> {
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Checkpointed, MAGIC};
+    use crate::nn::Param;
+    use std::path::PathBuf;
+
+    /// Modelo minimo: dois parametros e um buffer, com um hash de configuracao
+    /// que o teste controla.
+    struct Fake {
+        params: Vec<Param>,
+        buffer: Vec<f32>,
+        config: u64,
+    }
+
+    impl Fake {
+        fn new(config: u64, fill: f32) -> Self {
+            let mut params = vec![Param::new(6, true), Param::new(4, false)];
+            for (i, p) in params.iter_mut().enumerate() {
+                for (j, v) in p.v.iter_mut().enumerate() {
+                    *v = fill + i as f32 * 10.0 + j as f32;
+                }
+            }
+            Fake {
+                params,
+                buffer: vec![fill * 2.0; 3],
+                config,
+            }
+        }
+    }
+
+    impl Checkpointed for Fake {
+        fn visit_params(&mut self, f: &mut dyn FnMut(&mut Param)) {
+            for p in &mut self.params {
+                f(p);
+            }
+        }
+        fn visit_buffers(&mut self, f: &mut dyn FnMut(&mut Vec<f32>)) {
+            f(&mut self.buffer);
+        }
+        fn config_hash(&mut self) -> u64 {
+            self.config
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("rustnn-ckpt-{name}-{}.bin", std::process::id()));
+        p
+    }
+
+    #[test]
+    fn round_trip_preserva_tudo() {
+        let path = scratch("roundtrip");
+        let mut saved = Fake::new(0xABCD, 1.5);
+        saved.save(path.to_str().unwrap()).unwrap();
+
+        let mut loaded = Fake::new(0xABCD, 0.0);
+        loaded.load(path.to_str().unwrap()).unwrap();
+        for (a, b) in saved.params.iter().zip(&loaded.params) {
+            assert_eq!(a.v, b.v);
+        }
+        assert_eq!(saved.buffer, loaded.buffer);
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(MAGIC), "o arquivo tem de trazer o magic");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recusa_configuracao_diferente() {
+        let path = scratch("config");
+        Fake::new(0x1111, 1.0).save(path.to_str().unwrap()).unwrap();
+        let err = Fake::new(0x2222, 0.0).load(path.to_str().unwrap()).unwrap_err();
+        assert!(
+            err.to_string().contains("incompativel"),
+            "mensagem inesperada: {err}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn recusa_arquivo_truncado() {
+        let path = scratch("trunc");
+        Fake::new(7, 1.0).save(path.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 8]).unwrap();
+        assert!(Fake::new(7, 0.0).load(path.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Os checkpoints gravados antes do cabecalho existirem sao so o payload.
+    #[test]
+    fn aceita_legado_sem_cabecalho() {
+        let path = scratch("legado");
+        let mut original = Fake::new(42, 3.0);
+        original.save(path.to_str().unwrap()).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::write(&path, &bytes[super::HEADER_LEN..]).unwrap();
+
+        let mut loaded = Fake::new(42, 0.0);
+        loaded.load(path.to_str().unwrap()).unwrap();
+        assert_eq!(original.params[0].v, loaded.params[0].v);
+        assert_eq!(original.buffer, loaded.buffer);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Um save que falha nao pode deixar o `.tmp` para tras nem tocar no
+    /// arquivo bom que ja existia.
+    #[test]
+    fn save_nao_destroi_o_anterior_ao_falhar() {
+        let path = scratch("atomico");
+        Fake::new(1, 5.0).save(path.to_str().unwrap()).unwrap();
+        let bom = std::fs::read(&path).unwrap();
+
+        let ruim = path.join("nao-e-diretorio");
+        assert!(Fake::new(1, 9.0).save(ruim.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bom);
+        assert!(!PathBuf::from(format!("{}.tmp", ruim.display())).exists());
+        let _ = std::fs::remove_file(&path);
+    }
+}

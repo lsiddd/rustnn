@@ -14,6 +14,7 @@
 
 mod attn;
 mod bench;
+mod check;
 mod ckpt;
 mod cli;
 mod conv;
@@ -37,14 +38,6 @@ mod vit;
 #[global_allocator]
 static ALLOC: pool::Recycling = pool::Recycling;
 
-use model::ResNet;
-use nn::{softmax_ce, Param, Tensor};
-use rng::{rand_vec, Rng};
-use std::sync::Arc;
-use vit::{Cfg, Grads, Out, RustViT};
-
-include!("check.rs");
-
 fn set_threads(n: usize) {
     if n > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -62,7 +55,7 @@ fn main() {
         return bench::gemm();
     }
     if cfg.gradcheck {
-        let ok = layercheck(cfg.seed) & vitcheck(cfg.seed) & gradcheck(cfg.seed);
+        let ok = check::layercheck(cfg.seed) & check::vitcheck(cfg.seed) & check::gradcheck(cfg.seed);
         std::process::exit(if ok { 0 } else { 1 });
     }
     // O fingerprint so e reprodutivel numa thread: a ordem da arvore de reducao

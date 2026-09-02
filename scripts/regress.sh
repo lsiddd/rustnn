@@ -36,6 +36,9 @@ check_floor() {
 cd "$repo_dir"
 cargo build --release
 
+echo "== testes =="
+cargo test --release
+
 echo "== gradcheck =="
 "$binary" --gradcheck
 

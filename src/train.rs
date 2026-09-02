@@ -731,3 +731,45 @@ fn raw_note(raw: f32) -> String {
         format!(" (crua {:.2}%)", raw * 100.0)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{lr_at, raw_note};
+
+    /// O cronograma tem tres regioes e as bordas sao onde ele erra: `step == 0`
+    /// nao pode dar lr zero (o primeiro passo nao aprenderia nada) e o ultimo
+    /// passo tem de chegar ao piso.
+    #[test]
+    fn cronograma_do_lr() {
+        let (peak, lo, total, warm) = (6e-4f32, 1e-5f32, 1000usize, 100usize);
+        let inicio = lr_at(peak, lo, 0, total, warm);
+        assert!(inicio > lo && inicio < peak, "primeiro passo: {inicio}");
+
+        let topo = lr_at(peak, lo, warm - 1, total, warm);
+        assert!((topo - peak).abs() < 1e-9, "fim do warmup: {topo}");
+
+        let fim = lr_at(peak, lo, total, total, warm);
+        assert!((fim - lo).abs() < 1e-6, "ultimo passo: {fim}");
+
+        // Monotonico: sobe na rampa, desce no cosseno.
+        for s in 1..warm {
+            assert!(lr_at(peak, lo, s, total, warm) > lr_at(peak, lo, s - 1, total, warm));
+        }
+        for s in warm + 1..total {
+            assert!(lr_at(peak, lo, s, total, warm) < lr_at(peak, lo, s - 1, total, warm));
+        }
+    }
+
+    /// Sem warmup o cosseno tem de comecar no pico em vez de dividir por zero.
+    #[test]
+    fn cronograma_sem_warmup() {
+        let lr = lr_at(6e-4, 1e-5, 0, 1000, 0);
+        assert!((lr - 6e-4).abs() < 1e-9, "{lr}");
+    }
+
+    #[test]
+    fn nota_da_acuracia_crua() {
+        assert_eq!(raw_note(f32::NAN), "");
+        assert_eq!(raw_note(0.7359), " (crua 73.59%)");
+    }
+}
