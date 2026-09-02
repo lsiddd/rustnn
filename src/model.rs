@@ -83,7 +83,7 @@ impl BasicBlock {
         }
     }
 
-    fn buffers(&mut self, f: &mut dyn FnMut(&mut Vec<f32>)) {
+    pub fn buffers(&mut self, f: &mut dyn FnMut(&mut Vec<f32>)) {
         f(&mut self.b1.rm);
         f(&mut self.b1.rv);
         f(&mut self.b2.rm);
@@ -102,7 +102,6 @@ pub struct ResNet {
     pub blocks: Vec<BasicBlock>,
     pub fc: Linear,
     feat_hw: (usize, usize),
-    pub nclass: usize,
     pub name: String,
 }
 
@@ -127,7 +126,6 @@ impl ResNet {
             blocks,
             fc: Linear::new(width * 4, nclass, &mut rng),
             feat_hw: (8, 8),
-            nclass,
             name: format!("resnet{}-w{}", 6 * depth_n + 2, width),
         }
     }

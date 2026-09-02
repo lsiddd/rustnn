@@ -175,7 +175,7 @@ pub fn forward_image(
     bp: &mut [f32],
 ) {
     let (ckk, hw) = (sp.ckk(), sp.hw());
-    let mpan = (sp.cout + MR - 1) / MR;
+    let mpan = sp.cout.div_ceil(MR);
     let mut q = 0;
     let mut pc = 0;
     while pc < ckk {
@@ -214,7 +214,7 @@ pub fn dx_image(
     tile: &mut [f32],
 ) {
     let (ckk, hw) = (sp.ckk(), sp.hw());
-    let mpan = (ckk + MR - 1) / MR;
+    let mpan = ckk.div_ceil(MR);
     dx.fill(0.0);
     let mut q = 0;
     let mut pc = 0;
@@ -291,7 +291,7 @@ pub fn dw_image(
     bp: &mut [f32],
 ) {
     let (ckk, hw) = (sp.ckk(), sp.hw());
-    let mpan = (sp.cout + MR - 1) / MR;
+    let mpan = sp.cout.div_ceil(MR);
     dypack.pack(dy, sp.cout, hw);
     let mut q = 0;
     let mut pc = 0;

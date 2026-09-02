@@ -25,10 +25,6 @@ impl Tensor {
             w,
         }
     }
-    #[inline]
-    pub fn img(&self) -> usize {
-        self.c * self.h * self.w
-    }
     pub fn resize(&mut self, n: usize, c: usize, h: usize, w: usize) {
         self.n = n;
         self.c = c;
@@ -38,12 +34,22 @@ impl Tensor {
     }
 }
 
-/// Parametro treinavel: valor, gradiente e momento.
+/// Parametro treinavel: valor, gradiente, momento e forma.
+///
+/// `rows`/`cols` sao a forma da matriz quando o parametro e uma matriz 2D oculta.
+/// O Muon precisa dela para ortogonalizar o momento; parametros com `rows == 0`
+/// (vieses, ganhos de norma, LayerScale, embeddings, cabecas de saida) ficam no
+/// AdamW, que e onde o autor do metodo recomenda deixa-los.
 pub struct Param {
     pub v: Vec<f32>,
     pub g: Vec<f32>,
     pub m: Vec<f32>,
+    /// Segundo momento do AdamW. Vazio enquanto o parametro nao for atualizado
+    /// por ele: alocar para a rede inteira custaria memoria a toa no Muon.
+    pub v2: Vec<f32>,
     pub decay: bool,
+    pub rows: usize,
+    pub cols: usize,
 }
 
 impl Param {
@@ -52,8 +58,34 @@ impl Param {
             v: vec![0.0; n],
             g: vec![0.0; n],
             m: vec![0.0; n],
+            v2: Vec::new(),
             decay,
+            rows: 0,
+            cols: 0,
         }
+    }
+
+    /// Marca o parametro como matriz [rows x cols] row-major (elegivel ao Muon).
+    pub fn shaped(mut self, rows: usize, cols: usize) -> Param {
+        debug_assert_eq!(rows * cols, self.v.len());
+        self.rows = rows;
+        self.cols = cols;
+        self
+    }
+
+    /// Normal truncada em 2 sigma, a inicializacao usual de transformer.
+    pub fn trunc_normal(n: usize, std: f32, decay: bool, rng: &mut Rng) -> Param {
+        let mut p = Param::new(n, decay);
+        for x in p.v.iter_mut() {
+            let mut z = rng.normal();
+            let mut tries = 0;
+            while z.abs() > 2.0 && tries < 8 {
+                z = rng.normal();
+                tries += 1;
+            }
+            *x = z.clamp(-2.0, 2.0) * std;
+        }
+        p
     }
     pub fn filled(n: usize, val: f32, decay: bool) -> Param {
         let mut p = Param::new(n, decay);
@@ -166,32 +198,31 @@ impl Conv2d {
         let xstride = self.cin * x.h * x.w;
         let rm = RowMap::new(&sp);
 
-        let dw = dy
-            .d
-            .par_chunks(cout * hw)
-            .zip(x.d.par_chunks(xstride))
-            .fold(
-                || {
-                    (
-                        vec![0.0f32; cout * ckk],
-                        vec![0.0f32; 2 * KC * NR],
-                        PackedA::new(),
-                    )
-                },
-                |(mut acc, mut scratch, mut dyp), (dyi, xi)| {
-                    let (tmp, bp) = scratch.split_at_mut(KC * NR);
-                    conv::dw_image(&sp, &rm, &mut dyp, dyi, xi, &mut acc, tmp, bp);
-                    (acc, scratch, dyp)
-                },
-            )
-            .map(|(acc, ..)| acc)
-            .reduce(
-                || vec![0.0f32; cout * ckk],
-                |mut a, b| {
-                    a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
-                    a
-                },
-            );
+        let dw =
+            dy.d.par_chunks(cout * hw)
+                .zip(x.d.par_chunks(xstride))
+                .fold(
+                    || {
+                        (
+                            vec![0.0f32; cout * ckk],
+                            vec![0.0f32; 2 * KC * NR],
+                            PackedA::new(),
+                        )
+                    },
+                    |(mut acc, mut scratch, mut dyp), (dyi, xi)| {
+                        let (tmp, bp) = scratch.split_at_mut(KC * NR);
+                        conv::dw_image(&sp, &rm, &mut dyp, dyi, xi, &mut acc, tmp, bp);
+                        (acc, scratch, dyp)
+                    },
+                )
+                .map(|(acc, ..)| acc)
+                .reduce(
+                    || vec![0.0f32; cout * ckk],
+                    |mut a, b| {
+                        a.iter_mut().zip(b).for_each(|(x, y)| *x += y);
+                        a
+                    },
+                );
         self.w.g.iter_mut().zip(&dw).for_each(|(a, b)| *a += b);
     }
 
@@ -380,13 +411,11 @@ impl BatchNorm2d {
 
 /// dx *= (y > 0), onde y e a saida da ReLU.
 pub fn relu_back_(d: &mut Tensor, y: &Tensor) {
-    d.d.par_iter_mut()
-        .zip(y.d.par_iter())
-        .for_each(|(g, &v)| {
-            if v <= 0.0 {
-                *g = 0.0;
-            }
-        });
+    d.d.par_iter_mut().zip(y.d.par_iter()).for_each(|(g, &v)| {
+        if v <= 0.0 {
+            *g = 0.0;
+        }
+    });
 }
 
 pub fn add_(a: &mut Tensor, b: &Tensor) {
