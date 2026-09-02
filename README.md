@@ -67,13 +67,37 @@ mkdir -p data && curl -L -o /tmp/c100.tar.gz \
 tar xzf /tmp/c100.tar.gz -C data
 
 cargo build --release
+```
 
-./target/release/rustnn                      # treina o rustvit, 100 épocas
-./target/release/rustnn --arch resnet        # treina a ResNet de referência
-./target/release/rustnn --gradcheck          # as cinquenta checagens de gradiente
-./target/release/rustnn --bench 15           # imagens por segundo e GFLOP/s
-./target/release/rustnn --gemmbench          # GEMM por forma usada pelo modelo
-./target/release/rustnn --help               # todas as opções
+As duas redes vivem no mesmo binário e a opção `--arch` escolhe entre elas. O rustvit da
+seção 3.2 é o padrão.
+
+```bash
+# rustvit: o treino da tabela 6 e a sua reavaliação
+./target/release/rustnn --epochs 100 --ema 0.9998 --save checkpoint_rustvit.bin
+./target/release/rustnn --resume checkpoint_rustvit.bin --eval
+
+# ResNet: o treino de referência da seção 3.1
+./target/release/rustnn --arch resnet --epochs 30 --save checkpoint_w32.bin
+./target/release/rustnn --arch resnet --resume checkpoint_w32.bin --eval
+```
+
+As checagens e os cronômetros aceitam as duas arquiteturas.
+
+```bash
+./target/release/rustnn --gradcheck                    # as cinquenta checagens
+./target/release/rustnn --bench 15                     # vazão do rustvit
+./target/release/rustnn --arch resnet --batch 128 --bench 20   # vazão da ResNet
+./target/release/rustnn --gemmbench                    # GEMM por forma do modelo
+./target/release/rustnn --help                         # todas as opções
+```
+
+Um treino completo leva horas. Para uma verificação rápida de que os dois caminhos
+funcionam de ponta a ponta, `--subset` reduz o conjunto de treino.
+
+```bash
+./target/release/rustnn --subset 2000 --epochs 2 --warmup 1
+./target/release/rustnn --arch resnet --subset 2000 --epochs 2 --warmup 1
 ```
 
 Note que a compilação precisa ser feita em modo `--release`. O arquivo
@@ -312,16 +336,16 @@ a 50 MB por passo. Registramos um alocador global que guarda os blocos acima de 
 uma tabela de tamanho fixo de 96 posições e os devolve na próxima requisição de mesmo
 tamanho e alinhamento. A tabela tem tamanho fixo. Um `Vec` no lugar dela reentraria no
 alocador durante um `push` dentro do lock, segurando o próprio mutex. O ganho medido é
-de 2 a 3%, e não maior, porque o alocador do sistema já eleva o seu limiar de `mmap` de
-forma dinâmica até 32 MB.
+de 2 a 3%. O alocador do sistema já eleva o seu limiar de `mmap` de forma dinâmica até
+32 MB, e a reciclagem se soma a esse comportamento.
 
 ### 4.11 Buffers sem inicialização
 
-Os buffers que o GEMM sobrescreve por inteiro são alocados sem serem zerados. A economia
-é maior do que o normal aqui, porque o alocador da seção 4.10 devolve blocos sujos, e com
-isso o truque de página zerada do `calloc` deixa de se aplicar. Medimos, em rodadas
-alternadas, 87 imagens por segundo com os buffers não inicializados contra 68 com
-`vec![0.0; n]`, ou 21% do passo inteiro. A função que os aloca é `unsafe`, e o seu
+Os buffers que o GEMM sobrescreve por inteiro são alocados sem serem zerados. O alocador
+da seção 4.10 devolve blocos sujos, e com isso o truque de página zerada do `calloc`
+deixa de se aplicar, de modo que zerar custa uma passagem de escrita completa. Medimos,
+em rodadas alternadas, 87 imagens por segundo com os buffers não inicializados contra 68
+com `vec![0.0; n]`, ou 21% do passo inteiro. A função que os aloca é `unsafe`, e o seu
 contrato é que o chamador escreva os `n` elementos antes de ler qualquer um deles.
 
 ## 5. Resultados
@@ -418,8 +442,7 @@ exatas que o modelo usa.
 4. As três formas do meio ganham com o empacotamento paralelo da seção 4.7.*
 
 A linha de `dW` permanece na mesma taxa. O gargalo ali é a redução encadeada de 64
-acumuladores privados de 786 KB, e não o empacotamento. Uma redução em árvore está entre
-os itens da seção 7.
+acumuladores privados de 786 KB.
 
 **Onde o tempo é gasto.** Na ResNet, aproximadamente metade do tempo está dentro do
 micro-kernel, que opera no limite descrito na seção 4.1. O restante se divide entre o
@@ -440,10 +463,12 @@ do orçamento de passos quando a opção é omitida. O comando é
 ./target/release/rustnn --epochs 100 --ema 0.9998 --save checkpoint_rustvit.bin
 ```
 
-O treino foi interrompido na época 73 das 100 programadas, após 12 h 25 min. A acurácia
-reportada é a do conjunto de teste de 10 mil imagens, com média sobre o espelhamento
-horizontal, e o checkpoint salvo é o da média exponencial dos pesos. A acurácia de treino
-que o programa imprime é contada contra o rótulo dominante do lote após o mixup.
+O treino foi interrompido na época 73 das 100 programadas, após 12 h 25 min, de modo que
+o decaimento por cosseno não chegou ao seu valor final e a fase de augmentation reduzida
+da época 90 não foi executada. A acurácia reportada é a do conjunto de teste de 10 mil
+imagens, com média sobre o espelhamento horizontal, e o checkpoint salvo é o da média
+exponencial dos pesos. A acurácia de treino que o programa imprime é contada contra o
+rótulo dominante do lote após o mixup.
 
 Observamos a trajetória da tabela 6.
 
@@ -467,17 +492,8 @@ O checkpoint da época 70 reproduz 73,59% com
 ./target/release/rustnn --resume checkpoint_rustvit.bin --eval
 ```
 
-O decaimento por cosseno da taxa de aprendizado não chegou ao seu valor final, e a fase
-de augmentation reduzida, que começa na época 90, não foi executada. A taxa de ganho por
-dez épocas cai de 2,52 pontos no trecho 50 a 60 para 0,54 pontos no trecho 60 a 70.
-
-Note que a receita de regularização é a de um cronograma de 300 épocas aplicada a um de
-100. Weight decay de 0,06, RandAugment, mixup, cutmix, random erasing, label smoothing e
-stochastic depth se somam à autodestilação, e o efeito da regularização pesada aparece ao
-longo de muitas épocas. O currículo da seção 3.3 atenua isso no começo e no fim, e mantém
-força total entre as épocas 40 e 90, metade do treino. Uma configuração mais leve, com
-RandAugment em 0,15, mixup em 0,4, cutmix em 0,5 e a janela de força total encurtada para
-as épocas 50 a 80, é o próximo experimento indicado.
+A taxa de ganho por dez épocas cai de 2,52 pontos no trecho 50 a 60 para 0,54 pontos no
+trecho 60 a 70.
 
 ## 6. Verificação do backward
 
@@ -503,10 +519,9 @@ completas e a banda de valores singulares do Newton-Schulz formam o quarto.
 Observamos um erro relativo da ordem de 1e-4 por camada, de 2,9e-3 no rustvit completo e
 de 1,3e-3 na ResNet completa. As cinquenta checagens passam.
 
-O caso do Newton-Schulz merece uma nota. O polinômio quíntico do Muon não converge para
-valores singulares unitários, e sim para uma faixa em torno de 1, o que é deliberado na
-formulação original. A checagem correspondente usa uma tolerância de 0,5, e não a de 5e-3
-das demais.
+O polinômio quíntico do Muon leva os valores singulares para uma faixa em torno de 1,
+sem levá-los a exatamente 1, o que é deliberado na formulação original. A checagem
+correspondente usa tolerância de 0,5; as demais usam 5e-3.
 
 ## 7. Limitações conhecidas
 
@@ -536,6 +551,13 @@ acumuladores de `dW`, que é o gargalo da última linha da tabela 5.
 
 O mecanismo de talking heads foi projetado e retirado desta versão. O ganho estimado é de
 0,3 ponto, ao custo de 16,8 MB de cache por camada e de uma segunda redução no backward.
+
+A receita de regularização do rustvit é a de cronogramas de 300 épocas: weight decay de
+0,06, RandAugment, mixup, cutmix, random erasing, label smoothing e stochastic depth,
+somados à autodestilação. O currículo da seção 3.3 mantém força total entre as épocas 40
+e 90, metade de um cronograma de 100. Uma configuração mais leve, com RandAugment em
+0,15, mixup em 0,4, cutmix em 0,5 e a janela de força total entre as épocas 50 e 80, é o
+próximo experimento da lista.
 
 ## 8. Estrutura do repositório
 
