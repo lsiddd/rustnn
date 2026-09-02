@@ -754,24 +754,30 @@ impl RustViT {
         m += (d4 * (self.nclass + self.head.nc)) as u64;
         m
     }
+}
 
-    pub fn save(&mut self, path: &str) -> std::io::Result<()> {
-        let layout = self.checkpoint_layout()?;
-        ckpt::save(path, layout, |write| {
-            self.for_each_param(&mut |p| write(&p.v));
-            self.for_each_buffer(&mut |buffer| write(buffer));
-        })
+/// Gradientes que a perda multi-saida devolve ao modelo.
+#[derive(Default)]
+pub struct Grads {
+    pub logits: Vec<f32>,
+    pub coarse: Vec<f32>,
+    pub e1: Vec<f32>,
+    pub e2: Vec<f32>,
+    pub h1: Vec<f32>,
+    pub h2: Vec<f32>,
+    pub hfinal: Vec<f32>,
+}
+
+impl ckpt::Checkpointed for RustViT {
+    fn visit_params(&mut self, f: &mut dyn FnMut(&mut Param)) {
+        self.for_each_param(f);
     }
 
-    pub fn load(&mut self, path: &str) -> std::io::Result<()> {
-        let layout = self.checkpoint_layout()?;
-        ckpt::load(path, layout, |read| {
-            self.for_each_param(&mut |p| read(&mut p.v));
-            self.for_each_buffer(&mut |buffer| read(buffer));
-        })
+    fn visit_buffers(&mut self, f: &mut dyn FnMut(&mut Vec<f32>)) {
+        self.for_each_buffer(f);
     }
 
-    fn checkpoint_layout(&mut self) -> std::io::Result<ckpt::Layout> {
+    fn config_hash(&mut self) -> u64 {
         let mut fields = vec![
             self.cfg.width as u64,
             self.cfg.cmid as u64,
@@ -791,29 +797,6 @@ impl RustViT {
         fields.extend(self.cfg.mem_at.iter().map(|&value| value as u64));
         fields.push(self.head.parent.len() as u64);
         fields.extend(self.head.parent.iter().map(|&value| value as u64));
-        let config = ckpt::config_hash(b"rustvit", &fields);
-
-        let (mut tensors, mut scalars) = (0usize, 0usize);
-        self.for_each_param(&mut |p| {
-            tensors += 1;
-            scalars += p.v.len();
-        });
-        self.for_each_buffer(&mut |buffer| {
-            tensors += 1;
-            scalars += buffer.len();
-        });
-        ckpt::Layout::new(tensors, scalars, config)
+        ckpt::config_hash(b"rustvit", &fields)
     }
-}
-
-/// Gradientes que a perda multi-saida devolve ao modelo.
-#[derive(Default)]
-pub struct Grads {
-    pub logits: Vec<f32>,
-    pub coarse: Vec<f32>,
-    pub e1: Vec<f32>,
-    pub e2: Vec<f32>,
-    pub h1: Vec<f32>,
-    pub h2: Vec<f32>,
-    pub hfinal: Vec<f32>,
 }

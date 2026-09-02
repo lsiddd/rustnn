@@ -1,5 +1,6 @@
 //! Formato de checkpoint compartilhado pelas duas arquiteturas.
 
+use crate::nn::Param;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::Path;
@@ -17,7 +18,7 @@ pub struct Layout {
 }
 
 impl Layout {
-    pub fn new(tensors: usize, scalars: usize, config_hash: u64) -> io::Result<Self> {
+    fn new(tensors: usize, scalars: usize, config_hash: u64) -> io::Result<Self> {
         Ok(Self {
             tensors: u32::try_from(tensors)
                 .map_err(|_| invalid("checkpoint tem mais tensores que o formato suporta"))?,
@@ -32,6 +33,51 @@ impl Layout {
             .ok()
             .and_then(|n| n.checked_mul(size_of::<f32>()))
             .ok_or_else(|| invalid("tamanho do checkpoint excede a plataforma"))
+    }
+}
+
+/// Um modelo que sabe percorrer seus tensores sabe se salvar.
+///
+/// As duas arquiteturas diferem apenas no que entra no hash da configuracao.
+/// Contar tensores, escrever e ler e o mesmo codigo nas duas, e estava
+/// duplicado linha a linha entre `vit.rs` e `model.rs`.
+pub trait Checkpointed {
+    fn visit_params(&mut self, f: &mut dyn FnMut(&mut Param));
+    fn visit_buffers(&mut self, f: &mut dyn FnMut(&mut Vec<f32>));
+
+    /// FNV-1a dos campos que mudam a forma ou o significado dos pesos. E o que
+    /// faz um checkpoint de outra configuracao ser recusado em vez de carregado
+    /// torto.
+    fn config_hash(&mut self) -> u64;
+
+    fn layout(&mut self) -> io::Result<Layout> {
+        let config = self.config_hash();
+        let (mut tensors, mut scalars) = (0usize, 0usize);
+        self.visit_params(&mut |p| {
+            tensors += 1;
+            scalars += p.v.len();
+        });
+        self.visit_buffers(&mut |buffer| {
+            tensors += 1;
+            scalars += buffer.len();
+        });
+        Layout::new(tensors, scalars, config)
+    }
+
+    fn save(&mut self, path: &str) -> io::Result<()> {
+        let layout = self.layout()?;
+        write_checkpoint(path, layout, |write| {
+            self.visit_params(&mut |p| write(&p.v));
+            self.visit_buffers(&mut |buffer| write(buffer));
+        })
+    }
+
+    fn load(&mut self, path: &str) -> io::Result<()> {
+        let layout = self.layout()?;
+        read_checkpoint(path, layout, |read| {
+            self.visit_params(&mut |p| read(&mut p.v));
+            self.visit_buffers(&mut |buffer| read(buffer));
+        })
     }
 }
 
@@ -51,7 +97,7 @@ pub fn config_hash(kind: &[u8], values: &[u64]) -> u64 {
     hash
 }
 
-pub fn save(
+fn write_checkpoint(
     path: &str,
     layout: Layout,
     mut visit: impl FnMut(&mut dyn FnMut(&[f32])),
@@ -81,7 +127,7 @@ pub fn save(
     fs::rename(temporary, path)
 }
 
-pub fn load(
+fn read_checkpoint(
     path: &str,
     expected: Layout,
     mut visit: impl FnMut(&mut dyn FnMut(&mut [f32])),

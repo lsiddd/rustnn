@@ -5,6 +5,7 @@
 //! epocas, o `--bench` e o `--fingerprint` chamam esse mesmo codigo: um
 //! fingerprint que validasse uma copia do passo nao validaria nada.
 
+use crate::ckpt::Checkpointed;
 use crate::cli::Config;
 use crate::data::{self, Aug, IMG, NCLASS, PIX};
 use crate::eval;
@@ -152,6 +153,17 @@ pub fn targets(
         }
     }
 }
+
+/// Diferente do save, carregar e fatal: seguir com pesos aleatorios quando se
+/// pediu `--resume` daria um treino ou uma avaliacao silenciosamente errados.
+/// Sai limpo em vez de despejar o `Debug` de um `io::Error` e um core dump.
+fn load_or_die(path: &str, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("erro carregando o checkpoint '{path}': {e}");
+        std::process::exit(1);
+    }
+}
+
 /// Um checkpoint que nao grava e uma falha silenciosa: o treino segue horas e
 /// so no fim se descobre que nao ha pesos. Reportar e continuar, porque perder
 /// a epoca ainda e melhor que perder o treino.
@@ -505,7 +517,7 @@ pub fn run_vit(
 ) {
     let mut tr = Trainer::new(cfg, train, taxo, ntrain);
     if let Some(p) = &cfg.resume {
-        tr.net.load(p).expect("falha ao carregar checkpoint");
+        load_or_die(p, tr.net.load(p));
         println!("checkpoint carregado de {p}");
     }
     let macs = tr.net.macs();
@@ -622,7 +634,7 @@ fn progress(
 pub fn run_resnet(cfg: &Config, train: &data::Dataset, test: &data::Dataset, ntrain: usize) {
     let mut net = ResNet::new(cfg.depth, cfg.width, NCLASS, cfg.seed);
     if let Some(p) = &cfg.resume {
-        net.load(p).expect("falha ao carregar checkpoint");
+        load_or_die(p, net.load(p));
     }
     let (nparams, flops) = (net.num_params(), net.flops(IMG, IMG));
     println!(

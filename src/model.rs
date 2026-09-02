@@ -204,41 +204,25 @@ impl ResNet {
     pub fn step(&mut self, lr: f32, mom: f32, wd: f32) {
         self.for_each_param(&mut |p| p.step(lr, mom, wd));
     }
+}
 
-    pub fn save(&mut self, path: &str) -> std::io::Result<()> {
-        let layout = self.checkpoint_layout()?;
-        ckpt::save(path, layout, |write| {
-            self.for_each_param(&mut |p| write(&p.v));
-            self.for_each_buffer(&mut |buffer| write(buffer));
-        })
+impl ckpt::Checkpointed for ResNet {
+    fn visit_params(&mut self, f: &mut dyn FnMut(&mut Param)) {
+        self.for_each_param(f);
     }
 
-    pub fn load(&mut self, path: &str) -> std::io::Result<()> {
-        let layout = self.checkpoint_layout()?;
-        ckpt::load(path, layout, |read| {
-            self.for_each_param(&mut |p| read(&mut p.v));
-            self.for_each_buffer(&mut |buffer| read(buffer));
-        })
+    fn visit_buffers(&mut self, f: &mut dyn FnMut(&mut Vec<f32>)) {
+        self.for_each_buffer(f);
     }
 
-    fn checkpoint_layout(&mut self) -> std::io::Result<ckpt::Layout> {
-        let config = ckpt::config_hash(
+    fn config_hash(&mut self) -> u64 {
+        ckpt::config_hash(
             b"resnet",
             &[
                 self.blocks.len() as u64 / 3,
                 self.stem.cout as u64,
                 self.fc.fout as u64,
             ],
-        );
-        let (mut tensors, mut scalars) = (0usize, 0usize);
-        self.for_each_param(&mut |p| {
-            tensors += 1;
-            scalars += p.v.len();
-        });
-        self.for_each_buffer(&mut |buffer| {
-            tensors += 1;
-            scalars += buffer.len();
-        });
-        ckpt::Layout::new(tensors, scalars, config)
+        )
     }
 }
