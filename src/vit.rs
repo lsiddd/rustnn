@@ -12,6 +12,7 @@
 //! 0 de cada registro. E os pesos 2D sao atualizados pelo Muon (`optim.rs`).
 
 use crate::attn::{CrossAttn, SelfAttn};
+use crate::ckpt;
 use crate::linear::Linear;
 use crate::model::BasicBlock;
 use crate::nn::{gap_backward, gap_forward, BatchNorm2d, Conv2d, Param, Tensor};
@@ -19,7 +20,6 @@ use crate::norm::{DwConv3, LayerNorm, LayerScale, SeqPool, SwiGlu};
 use crate::rng::Rng;
 use crate::tok::{add_, Tok};
 use rayon::prelude::*;
-use std::io::{Read, Write};
 use std::sync::Arc;
 
 /// Descarta o ramo inteiro de uma imagem com probabilidade `p`.
@@ -756,38 +756,53 @@ impl RustViT {
     }
 
     pub fn save(&mut self, path: &str) -> std::io::Result<()> {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-        let mut err = Ok(());
-        let mut w = |v: &Vec<f32>, err: &mut std::io::Result<()>| {
-            if err.is_ok() {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-                *err = f.write_all(&bytes);
-            }
-        };
-        let mut params: Vec<Vec<f32>> = Vec::new();
-        self.for_each_param(&mut |p| params.push(p.v.clone()));
-        let mut bufs: Vec<Vec<f32>> = Vec::new();
-        self.for_each_buffer(&mut |b| bufs.push(b.clone()));
-        for v in params.iter().chain(bufs.iter()) {
-            w(v, &mut err);
-        }
-        err?;
-        f.flush()
+        let layout = self.checkpoint_layout()?;
+        ckpt::save(path, layout, |write| {
+            self.for_each_param(&mut |p| write(&p.v));
+            self.for_each_buffer(&mut |buffer| write(buffer));
+        })
     }
 
     pub fn load(&mut self, path: &str) -> std::io::Result<()> {
-        let mut buf = Vec::new();
-        std::fs::File::open(path)?.read_to_end(&mut buf)?;
-        let mut off = 0usize;
-        let mut rd = |v: &mut Vec<f32>| {
-            for x in v.iter_mut() {
-                *x = f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                off += 4;
-            }
-        };
-        self.for_each_param(&mut |p| rd(&mut p.v));
-        self.for_each_buffer(&mut |b| rd(b));
-        Ok(())
+        let layout = self.checkpoint_layout()?;
+        ckpt::load(path, layout, |read| {
+            self.for_each_param(&mut |p| read(&mut p.v));
+            self.for_each_buffer(&mut |buffer| read(buffer));
+        })
+    }
+
+    fn checkpoint_layout(&mut self) -> std::io::Result<ckpt::Layout> {
+        let mut fields = vec![
+            self.cfg.width as u64,
+            self.cfg.cmid as u64,
+            self.cfg.dim as u64,
+            self.cfg.heads as u64,
+            self.cfg.depth3 as u64,
+            self.cfg.dim4 as u64,
+            self.cfg.heads4 as u64,
+            self.cfg.depth4 as u64,
+            self.cfg.droppath.to_bits() as u64,
+            self.cfg.img as u64,
+            self.nclass as u64,
+            self.head.nc as u64,
+            self.use_exits as u64,
+            self.cfg.mem_at.len() as u64,
+        ];
+        fields.extend(self.cfg.mem_at.iter().map(|&value| value as u64));
+        fields.push(self.head.parent.len() as u64);
+        fields.extend(self.head.parent.iter().map(|&value| value as u64));
+        let config = ckpt::config_hash(b"rustvit", &fields);
+
+        let (mut tensors, mut scalars) = (0usize, 0usize);
+        self.for_each_param(&mut |p| {
+            tensors += 1;
+            scalars += p.v.len();
+        });
+        self.for_each_buffer(&mut |buffer| {
+            tensors += 1;
+            scalars += buffer.len();
+        });
+        ckpt::Layout::new(tensors, scalars, config)
     }
 }
 

@@ -1,8 +1,8 @@
 //! ResNet estilo CIFAR: stem 3x3 + 3 estagios de blocos residuais + GAP + FC.
 
+use crate::ckpt;
 use crate::nn::*;
 use crate::rng::Rng;
-use std::io::{Read, Write};
 use std::sync::Arc;
 
 pub struct BasicBlock {
@@ -206,38 +206,39 @@ impl ResNet {
     }
 
     pub fn save(&mut self, path: &str) -> std::io::Result<()> {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-        let mut w = |v: &Vec<f32>| -> std::io::Result<()> {
-            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-            f.write_all(&bytes)
-        };
-        let mut err = Ok(());
-        self.for_each_param(&mut |p| {
-            if err.is_ok() {
-                err = w(&p.v);
-            }
-        });
-        self.for_each_buffer(&mut |b| {
-            if err.is_ok() {
-                err = w(b);
-            }
-        });
-        err?;
-        f.flush()
+        let layout = self.checkpoint_layout()?;
+        ckpt::save(path, layout, |write| {
+            self.for_each_param(&mut |p| write(&p.v));
+            self.for_each_buffer(&mut |buffer| write(buffer));
+        })
     }
 
     pub fn load(&mut self, path: &str) -> std::io::Result<()> {
-        let mut buf = Vec::new();
-        std::fs::File::open(path)?.read_to_end(&mut buf)?;
-        let mut off = 0usize;
-        let mut rd = |v: &mut Vec<f32>| {
-            for x in v.iter_mut() {
-                *x = f32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
-                off += 4;
-            }
-        };
-        self.for_each_param(&mut |p| rd(&mut p.v));
-        self.for_each_buffer(&mut |b| rd(b));
-        Ok(())
+        let layout = self.checkpoint_layout()?;
+        ckpt::load(path, layout, |read| {
+            self.for_each_param(&mut |p| read(&mut p.v));
+            self.for_each_buffer(&mut |buffer| read(buffer));
+        })
+    }
+
+    fn checkpoint_layout(&mut self) -> std::io::Result<ckpt::Layout> {
+        let config = ckpt::config_hash(
+            b"resnet",
+            &[
+                self.blocks.len() as u64 / 3,
+                self.stem.cout as u64,
+                self.fc.fout as u64,
+            ],
+        );
+        let (mut tensors, mut scalars) = (0usize, 0usize);
+        self.for_each_param(&mut |p| {
+            tensors += 1;
+            scalars += p.v.len();
+        });
+        self.for_each_buffer(&mut |buffer| {
+            tensors += 1;
+            scalars += buffer.len();
+        });
+        ckpt::Layout::new(tensors, scalars, config)
     }
 }
