@@ -566,7 +566,7 @@ próximo experimento da lista.
 | `src/gemm.rs` | micro-kernel AVX2/FMA 6×16, empacotamento dos dois operandos, drivers paralelo e sequencial |
 | `src/conv.rs` | convolução com im2col e col2im fundidos ao empacotamento |
 | `src/nn.rs` | Conv2d, BatchNorm2d, Linear, pooling, ReLU, softmax e entropia cruzada |
-| `src/model.rs` | blocos residuais, a ResNet completa e os checkpoints |
+| `src/model.rs` | blocos residuais e a ResNet completa |
 | `src/tok.rs` | tensor de tokens em layout `[n, t, c]` |
 | `src/linear.rs` | camada densa sobre o driver de GEMM |
 | `src/norm.rs` | LayerNorm, SwiGLU, LayerScale, depthwise 3×3 e redução por atenção |
@@ -577,5 +577,10 @@ próximo experimento da lista.
 | `src/pool.rs` | alocador global que recicla os blocos grandes |
 | `src/data.rs` | leitor do CIFAR-100 binário, taxonomia e augmentation |
 | `src/rng.rs` | gerador xoshiro256++ |
+| `src/ckpt.rs` | formato de checkpoint compartilhado pelas duas arquiteturas |
+| `src/cli.rs` | opções de linha de comando, com parsing e validação |
+| `src/train.rs` | o passo de treino e os laços que o chamam |
+| `src/eval.rs` | laço de avaliação, compartilhado pelas duas arquiteturas |
+| `src/bench.rs` | cronometragem do GEMM e de um passo de cada rede |
 | `src/check.rs` | as cinquenta checagens de gradiente |
-| `src/main.rs` | interface de linha de comando, laços de treino, avaliação e benchmarks |
+| `src/main.rs` | despacho: escolhe o modo e chama o módulo correspondente |
