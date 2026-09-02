@@ -146,6 +146,9 @@ impl Optim {
         for p in adam.iter_mut() {
             self.step_adam(p, lr, wd);
         }
+        // Depois do passo, nao antes: `step_adam` corrige o vies com `t + 1`.
+        // Ficava a cargo do chamador, e o caminho do `--bench` esquecia.
+        self.t += 1;
     }
 
     fn step_adam(&self, p: &mut Param, lr: f32, wd: f32) {
@@ -234,6 +237,14 @@ impl Ema {
 
     /// Troca os pesos do modelo pelos da media, devolvendo os originais.
     pub fn swap_in(&mut self, params: &mut Vec<&mut Param>) -> Vec<Vec<f32>> {
+        // Sem isto o `zip` troca so o prefixo comum e devolve sucesso: uma EMA
+        // nunca atualizada salvaria os pesos crus se dizendo media.
+        assert!(
+            self.ready && self.w.len() == params.len(),
+            "EMA com {} tensores para {} parametros",
+            self.w.len(),
+            params.len()
+        );
         let mut old = Vec::with_capacity(params.len());
         for (p, e) in params.iter_mut().zip(self.w.iter()) {
             old.push(p.v.clone());
@@ -243,6 +254,11 @@ impl Ema {
     }
 
     pub fn swap_out(params: &mut Vec<&mut Param>, old: Vec<Vec<f32>>) {
+        assert_eq!(
+            params.len(),
+            old.len(),
+            "swap_out com um numero de tensores diferente do swap_in"
+        );
         for (p, o) in params.iter_mut().zip(old) {
             p.v.copy_from_slice(&o);
         }

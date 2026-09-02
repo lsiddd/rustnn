@@ -56,6 +56,7 @@ fn set_threads(n: usize) {
 
 fn main() {
     let cfg = cli::parse();
+    cli::validate(&cfg);
     if cfg.gemmbench {
         set_threads(cfg.threads);
         return bench::gemm();

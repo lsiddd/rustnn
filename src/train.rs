@@ -362,7 +362,6 @@ impl<'a> Trainer<'a> {
             optim::clip_(&mut ps, clip);
         }
         self.opt.step_all(&mut ps, lr, wd);
-        self.opt.t += 1;
         if let Some(e) = &mut self.ema {
             e.update(&ps);
         }
