@@ -40,7 +40,9 @@ echo "== gradcheck =="
 "$binary" --gradcheck
 
 echo "== fingerprint =="
-fingerprint_output=$("$binary" --fingerprint 1 --threads 1 --batch 2 --subset 2)
+# 20 passos com 64 imagens e batch 8 sao 2,5 epocas: cruzam a fronteira de
+# epoca, exercitam o reembaralhamento e saem do passo 0 do warmup. Custa 12 s.
+fingerprint_output=$("$binary" --fingerprint 20 --threads 1 --batch 8 --subset 64)
 echo "$fingerprint_output"
 actual_fingerprint=$(awk '/^fingerprint:/ { print $2 }' <<<"$fingerprint_output")
 expected_fingerprint=$(value fingerprint)

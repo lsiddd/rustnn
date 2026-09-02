@@ -430,14 +430,32 @@ impl<'a> Trainer<'a> {
         optim::Ema::swap_out(&mut ps, old);
     }
 
-    /// Hash FNV-1a de todo o estado que o treino evolui.
+    /// Hash FNV-1a de todo o estado que o treino evolui: pesos, momentos do
+    /// otimizador, media exponencial, contador de passos e a ultima perda.
+    ///
+    /// Os momentos entram porque um bug que so afeta o segundo momento do
+    /// AdamW levaria dezenas de passos para aparecer nos pesos, e a EMA porque
+    /// e ela que vai para o checkpoint.
     pub fn fingerprint(&mut self, last_loss: f32) -> u64 {
         let mut hash = FNV_OFFSET;
         self.net.for_each_param(&mut |p| {
-            for &value in &p.v {
-                hash = fnv_f32(hash, value);
+            for slice in [&p.v, &p.m, &p.v2] {
+                for &value in slice {
+                    hash = fnv_f32(hash, value);
+                }
             }
         });
+        if let Some(e) = &self.ema {
+            for w in &e.w {
+                for &value in w {
+                    hash = fnv_f32(hash, value);
+                }
+            }
+        }
+        for byte in (self.opt.t as u64).to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
         fnv_f32(hash, last_loss)
     }
 }
