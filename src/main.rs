@@ -506,6 +506,15 @@ fn eval_vit(net: &mut RustViT, ds: &data::Dataset, batch: usize, tta: bool) -> (
     (loss_ / seen as f32, correct as f32 / seen as f32)
 }
 
+/// Um checkpoint que nao grava e uma falha silenciosa: o treino segue horas e
+/// so no fim se descobre que nao ha pesos. Reportar e continuar, porque perder
+/// a epoca ainda e melhor que perder o treino.
+fn report_save(path: &str, result: std::io::Result<()>) {
+    if let Err(e) = result {
+        eprintln!("\naviso: falha ao salvar checkpoint em '{path}': {e}");
+    }
+}
+
 fn fmt_hms(secs: f64) -> String {
     let s = secs as u64;
     format!("{:02}:{:02}:{:02}", s / 3600, (s / 60) % 60, s % 60)
@@ -978,12 +987,12 @@ fn main() {
                     net.for_each_param(&mut |p| ps.push(unsafe { &mut *(p as *mut Param) }));
                     let old = ema.as_mut().unwrap().swap_in(&mut ps);
                     drop(ps);
-                    let _ = net.save(p);
+                    report_save(p, net.save(p));
                     let mut ps: Vec<&mut Param> = Vec::new();
                     net.for_each_param(&mut |p| ps.push(unsafe { &mut *(p as *mut Param) }));
                     optim::Ema::swap_out(&mut ps, old);
                 } else {
-                    let _ = net.save(p);
+                    report_save(p, net.save(p));
                 }
             }
         }
@@ -1122,7 +1131,7 @@ fn run_resnet(cfg: &Config, train: &data::Dataset, test: &data::Dataset, ntrain:
         if ta > best {
             best = ta;
             if let Some(p) = &cfg.save {
-                let _ = net.save(p);
+                report_save(p, net.save(p));
             }
         }
         println!(
